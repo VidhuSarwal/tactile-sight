@@ -1,54 +1,115 @@
-# TactileSight Band — Increment 0: Depth-to-Haptic Pipeline
+# TactileSight Band — Increment 0
 
-macOS development beta. Zero hardware required. Simulates the full depth-sensing → haptic-level pipeline that will run on the physical device.
+Depth-to-haptic pipeline. Runs fully without hardware (simulated camera, terminal display). Real Orbbec Astra Pro Plus slots in later with no code changes.
 
-## Requirements
+---
 
-Python 3.10+, `numpy`, `pyyaml`. No other dependencies.
+## Quick start — Windows (no camera needed)
 
-```bash
-pip install numpy pyyaml
+**Requirements:** Python 3.10+ — download from https://www.python.org/downloads/ (tick "Add to PATH" during install)
+
+```
+1. Download the release ZIP from the Releases page and extract it anywhere.
+2. Double-click  setup.bat  (installs numpy, pyyaml, openni)
+3. Open a terminal in the folder and run a scene:
 ```
 
-## Running scenes
-
-From the repo root:
-
-```bash
-# Wall approaching — all cells ramp from silent to max intensity
-python main.py --source mock --scene wall_approach --sink sim
-
-# Doorway on the left — left columns stay quiet, right columns active
-python main.py --source mock --scene doorway_left --sink sim
-
-# Person crossing — near blob marches from right to left across columns
-python main.py --source mock --scene person_crossing --sink sim
-
-# All clear — everything silent
-python main.py --source mock --scene all_clear --sink sim
-
-# Keyboard-step mode (press Enter to advance one frame at a time)
-python main.py --source mock --scene wall_approach --sink sim --step
+```bat
+run.bat --scene wall_approach
+run.bat --scene doorway_left
+run.bat --scene person_crossing
+run.bat --scene all_clear
 ```
 
-Press `Ctrl-C` to exit any scene cleanly.
+Press `Ctrl-C` to stop. That's it — no camera, no drivers, nothing else needed.
 
-## Running tests
+---
 
-```bash
-pytest tests/ -v
+## Scenes
+
+| Scene | What you see |
+|---|---|
+| `wall_approach` | All cells ramp from silent to max as a wall closes in |
+| `doorway_left` | Left columns stay quiet (open corridor), right columns activate |
+| `person_crossing` | High-intensity blob marches right-to-left across columns |
+| `all_clear` | All cells silent |
+
+Step through frames manually (useful for debugging):
+```bat
+run.bat --scene wall_approach --step
 ```
+
+---
 
 ## Adding a new scene
 
-1. Open `src/tactile/depth_source.py`.
-2. Write a generator function that yields `(8, 2)` `float32` NumPy arrays indefinitely (loop when the sequence ends). Use `np.nan` for invalid cells. Axis-0 = column (0 = wearer's left), axis-1 = row (0 = top).
-3. Register it in the `_SCENES` dict at the bottom of the file:
+1. Open `src/tactile/depth_source.py`
+2. Write a generator that yields `(8, 2)` float32 arrays indefinitely (loop at the end). Use `np.nan` for invalid cells. Axis 0 = column (0 = wearer's left), axis 1 = row (0 = top).
+3. Register it in `_SCENES`:
    ```python
    _SCENES["my_scene"] = _my_scene
    ```
-4. It becomes available immediately via `--scene my_scene`. Noise and occasional invalid cells are injected automatically by `MockSource`.
+4. Run it: `run.bat --scene my_scene`
 
-## What changes when the real camera adapter lands
+---
 
-Replace `MockSource` with an `OrbecSource(DepthSource)` class that calls `device.get_depth_frame()` on the Orbbec Astra Pro Plus SDK, averages depth pixels within each of the 8×2 spatial patches that map to the motor grid, and returns `np.nan` wherever the SDK reports invalid or out-of-range pixels. No other file changes are required — the `Encoder`, `SimDisplay`, and `main.py` pipeline are hardware-agnostic by design. The STM32 RPC sink similarly slots in as a `Sink` subclass that serializes the 16-byte frame over serial/USB rather than printing to the terminal.
+## Camera setup — Windows (Orbbec Astra Pro Plus)
+
+**Step 1 — Install the Orbbec OpenNI2 SDK**
+
+Download the Windows installer from:
+https://github.com/orbbec/OpenNI2/releases
+
+Run the `.exe`. It installs the driver and sets the `OPENNI2_REDIST64` environment variable automatically — no manual path configuration needed.
+
+**Step 2 — Plug in the camera and verify**
+
+```bat
+python check_camera.py
+```
+
+Expected output when everything is working:
+```
+✓ USB device detected
+✓ OpenNI2 runtime found
+✓ SDK initialised
+✓ Camera opened
+✓ Depth stream readable
+```
+
+If Device 4 shows an error in Device Manager, re-run the Orbbec installer and select "Repair".
+
+---
+
+## Camera setup — Ubuntu (reference)
+
+```bash
+sudo apt install libopenni2-0 openni2-utils usbutils
+pip3 install numpy pyyaml openni
+python3 check_camera.py
+```
+
+If the camera is detected on USB but the device won't open:
+```bash
+sudo usermod -aG plugdev $USER   # log out and back in after this
+```
+
+---
+
+## Running tests
+
+```bat
+python -m pytest tests/ -v
+```
+
+---
+
+## What changes when the real camera is wired in
+
+Replace `MockSource` with an `OrbecSource(DepthSource)` class that:
+- Calls `openni2.Device.open_any()` and starts a depth stream
+- Reads one frame per `get_grid()` call
+- Averages depth pixels within each of the 8×2 spatial patches
+- Returns `np.nan` where the SDK reports zero or out-of-range pixels
+
+No other file changes needed — `Encoder`, `SimDisplay`, and `main.py` are hardware-agnostic.
