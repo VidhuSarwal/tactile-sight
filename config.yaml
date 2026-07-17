@@ -1,0 +1,14 @@
+depth:
+  min_distance: 0.7    # m — maps to level 255
+  max_distance: 3.0    # m — maps to level 0
+
+encoder:
+  ema_alpha: 0.33       # ~3-frame EMA
+  hysteresis_on: 2.8    # activate cell below this (m)
+  hysteresis_off: 3.2   # deactivate cell above this (m)
+  near_threshold: 1.0   # blind-zone near threshold (m)
+  hold_frames: 30       # frames to hold near-blind reading (30 = 1s @ 30Hz)
+
+display:
+  frame_rate: 30          # Hz
+  hex_interval_frames: 30 # print hex frame every N frames
