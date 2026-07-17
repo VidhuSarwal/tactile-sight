@@ -1,33 +1,25 @@
 @echo off
 setlocal
 
-:: pip is present but "python" may not be in PATH.
-:: Try the Windows Python Launcher (py), then fall back to python.
 where py >nul 2>&1
-if %errorlevel% equ 0 (
-    set PYEXE=py
-    goto found
-)
+if %errorlevel% equ 0 ( set PYEXE=py & goto install )
 where python >nul 2>&1
-if %errorlevel% equ 0 (
-    set PYEXE=python
-    goto found
-)
+if %errorlevel% equ 0 ( set PYEXE=python & goto install )
 
-echo Python launcher not found.
-echo pip is installed but the Python executable is not in PATH.
-echo Fix: re-run the Python installer and tick "Add Python to PATH".
-echo Download: https://www.python.org/downloads/
+echo Python not found in PATH.
+echo Download Python 3.10+ from https://www.python.org/downloads/
+echo (tick "Add Python to PATH" during install)
 pause
 exit /b 1
 
-:found
+:install
 echo Using: %PYEXE%
 echo.
 echo Installing dependencies...
-pip install numpy pyyaml openni
+pip install numpy pyyaml pyorbbecsdk2
 if %errorlevel% neq 0 (
-    echo pip install failed. Check your internet connection.
+    echo.
+    echo pip install failed. Check your internet connection and try again.
     pause
     exit /b 1
 )

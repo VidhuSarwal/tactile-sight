@@ -2,23 +2,22 @@
 """
 Orbbec Astra Pro Plus — camera diagnostic (Windows & Linux)
 
+Requires only:  pip install pyorbbecsdk2
+No separate SDK download needed — the native library is bundled in the package.
+
 Steps:
   1. USB    — camera physically detected
-  2. Runtime — OpenNI2 native library found
-  3. Init   — Python binding loads the library
-  4. Device — SDK opens the camera
-  5. Depth  — firmware streams valid frames
+  2. Package — pyorbbecsdk2 importable
+  3. Device  — SDK finds the camera
+  4. Info    — device name / firmware
+  5. Depth   — firmware streams valid frames
 
 Usage:
-    python check_camera.py
-    python check_camera.py --sdk-path "C:/Program Files/OpenNI2/Redist"
+    python check_camera.py          (or:  check_camera.bat  on Windows)
 """
 from __future__ import annotations
-import argparse
-import os
 import platform
 import subprocess
-from pathlib import Path
 
 _BOLD   = "\033[1m"
 _GREEN  = "\033[32m"
@@ -31,40 +30,8 @@ def fail(msg: str) -> str: return f"{_RED}✗{_RESET} {msg}"
 def warn(msg: str) -> str: return f"{_YELLOW}⚠{_RESET} {msg}"
 def head(msg: str) -> str: return f"\n{_BOLD}{msg}{_RESET}"
 
-_IS_WINDOWS = platform.system() == "Windows"
-
-# OpenNI2 library name differs by OS
-_LIB_NAME = "OpenNI2.dll" if _IS_WINDOWS else "libOpenNI2.so"
-
-# Orbbec USB search terms (vendor ID 2bc5)
+_IS_WINDOWS   = platform.system() == "Windows"
 _SEARCH_TERMS = {"orbbec", "astra", "2bc5"}
-
-# ── Library search paths ───────────────────────────────────────────────────────
-
-def _candidate_paths() -> list[Path]:
-    if _IS_WINDOWS:
-        candidates = [
-            # The Orbbec/OpenNI2 installer sets this env var — fastest path
-            Path(os.environ.get("OPENNI2_REDIST64", "")),
-            Path(os.environ.get("OPENNI2_REDIST",   "")),
-            Path("C:/Program Files/OpenNI2/Redist"),
-            Path("C:/Program Files (x86)/OpenNI2/Redist"),
-            Path("C:/OpenNI2/Redist"),
-            Path("C:/Program Files/Orbbec/OpenNI2/Redist"),
-        ]
-    else:
-        candidates = [
-            Path("/usr/lib"),
-            Path("/usr/local/lib"),
-            Path("/usr/lib/x86_64-linux-gnu"),
-            Path("/usr/lib/aarch64-linux-gnu"),
-            Path("/opt/OpenNI2"),
-            Path.home() / "OpenNI2",
-            Path.home() / "Downloads" / "OpenNI2",
-        ]
-    # also check CWD / ./Redist for users who extracted the SDK next to the script
-    candidates += [Path("."), Path("Redist")]
-    return [p for p in candidates if str(p)]  # drop empty strings from missing env vars
 
 
 # ── Step 1: USB ────────────────────────────────────────────────────────────────
@@ -72,18 +39,18 @@ def _candidate_paths() -> list[Path]:
 def check_usb() -> bool:
     print(head("Step 1 — USB device detection"))
     if _IS_WINDOWS:
-        return _check_usb_windows()
-    return _check_usb_linux()
+        return _usb_windows()
+    return _usb_linux()
 
 
-def _check_usb_windows() -> bool:
+def _usb_windows() -> bool:
     try:
         result = subprocess.run(
             [
                 "powershell", "-NoProfile", "-Command",
                 "Get-PnpDevice -PresentOnly | "
                 "Where-Object { $_.FriendlyName -match 'Orbbec|Astra|2bc5' } | "
-                "Format-List FriendlyName,Status,InstanceId",
+                "Format-List FriendlyName,Status",
             ],
             capture_output=True, text=True, timeout=15,
         )
@@ -91,7 +58,8 @@ def _check_usb_windows() -> bool:
         if out:
             print(ok("Orbbec device found:"))
             for line in out.splitlines():
-                print(f"    {line}")
+                if line.strip():
+                    print(f"    {line.strip()}")
             return True
         print(fail("No Orbbec device found."))
         print("    → Plug in the Astra Pro Plus and retry.")
@@ -105,7 +73,7 @@ def _check_usb_windows() -> bool:
         return False
 
 
-def _check_usb_linux() -> bool:
+def _usb_linux() -> bool:
     try:
         result = subprocess.run(
             ["lsusb"], capture_output=True, text=True, timeout=10
@@ -117,127 +85,93 @@ def _check_usb_linux() -> bool:
             for l in hits:
                 print(f"    {l.strip()}")
             return True
-        print(fail("No Orbbec device found.  Plug in the camera and retry."))
+        print(fail("No Orbbec device found. Plug in the camera and retry."))
         return False
     except FileNotFoundError:
-        print(warn("lsusb not found.  Run:  sudo apt install usbutils"))
+        print(warn("lsusb not found.  Install it:  sudo apt install usbutils"))
         return False
 
 
-# ── Step 2: OpenNI2 runtime ────────────────────────────────────────────────────
+# ── Step 2: Package ────────────────────────────────────────────────────────────
 
-def check_openni2_runtime(sdk_path: Path | None) -> Path | None:
-    print(head("Step 2 — OpenNI2 runtime"))
-
-    if sdk_path is not None:
-        if not sdk_path.exists():
-            print(fail(f"--sdk-path not found: {sdk_path}"))
-            sdk_path = None
-        else:
-            lib = sdk_path / _LIB_NAME
-            if lib.exists():
-                print(ok(f"Found {_LIB_NAME} at: {lib}"))
-                return sdk_path
-            print(fail(f"{_LIB_NAME} not in {sdk_path}"))
-            sdk_path = None
-
-    for base in _candidate_paths():
-        lib = base / _LIB_NAME
-        if lib.exists():
-            print(ok(f"Found {_LIB_NAME} at: {lib}"))
-            return base
-
-    print(fail(f"{_LIB_NAME} not found."))
-    _install_instructions()
-    return None
-
-
-def _install_instructions() -> None:
-    if _IS_WINDOWS:
-        print("""
-    Install the Orbbec OpenNI2 SDK for Windows:
-
-    1. Download:  https://github.com/orbbec/OpenNI2/releases
-       File: OpenNI-Windows-x64-2.x.x.zip  (or the .exe installer)
-
-    2. Run the installer (or extract the zip).
-       The installer sets OPENNI2_REDIST64 automatically.
-
-    3. Re-run:  python check_camera.py
-""")
-    else:
-        print("""
-    Install OpenNI2 on Ubuntu:
-
-    Option A (apt):
-        sudo apt update && sudo apt install libopenni2-0 openni2-utils
-
-    Option B (Orbbec SDK):  https://github.com/orbbec/OpenNI2/releases
-        python check_camera.py --sdk-path <extracted>/Redist
-
-    Re-run:  python check_camera.py
-""")
-
-
-# ── Step 3: SDK init ───────────────────────────────────────────────────────────
-
-def check_sdk_init(lib_dir: Path) -> bool:
-    print(head("Step 3 — SDK initialisation"))
+def check_package() -> bool:
+    print(head("Step 2 — pyorbbecsdk2 package"))
     try:
-        from openni import openni2
+        from pyorbbecsdk import Context, OBLogLevel  # type: ignore
+        Context.set_logger_to_console(OBLogLevel.ERROR)  # suppress SDK noise
+        print(ok("pyorbbecsdk2 imported successfully."))
+        return True
     except ImportError:
-        print(fail("openni package missing.  Run:  pip install openni"))
+        print(fail("pyorbbecsdk2 not installed."))
+        print("    Run:  pip install pyorbbecsdk2")
         return False
-    try:
-        openni2.initialize(str(lib_dir))
-        print(ok("OpenNI2 initialised."))
-        return True
-    except Exception as exc:
-        print(fail(f"openni2.initialize() failed: {exc}"))
-        print(f"    → Path tried: {lib_dir}")
+
+
+# ── Step 3: Device discovery ───────────────────────────────────────────────────
+
+def check_device_found() -> bool:
+    print(head("Step 3 — Device discovery"))
+    from pyorbbecsdk import Context, OBLogLevel  # type: ignore
+    Context.set_logger_to_console(OBLogLevel.ERROR)
+    ctx = Context()
+    device_list = ctx.query_devices()
+    count = device_list.get_count()
+    if count == 0:
+        print(fail("No Orbbec device found by SDK."))
         if not _IS_WINDOWS:
-            print("    → Try: sudo usermod -aG plugdev $USER  (then log out/in)")
-        return False
-
-
-# ── Step 4: Device open ────────────────────────────────────────────────────────
-
-def check_device_open() -> bool:
-    print(head("Step 4 — Open camera device"))
-    from openni import openni2
-    try:
-        device = openni2.Device.open_any()
-        info   = device.get_device_info()
-        print(ok(f"Opened: {info.name!r}   URI: {info.uri!r}"))
-        device.close()
-        return True
-    except openni2.OpenNIError as exc:
-        print(fail(f"Cannot open device: {exc}"))
-        if _IS_WINDOWS:
-            print("    → Run Device Manager; check for driver errors on the Orbbec entry.")
+            print("    → Add yourself to the plugdev group:")
+            print("          sudo usermod -aG plugdev $USER   (log out and back in)")
         else:
-            print("    → Try running as root once to rule out permissions.")
+            print("    → Check Device Manager for driver errors.")
         return False
+    print(ok(f"Found {count} device(s)."))
+    return True
+
+
+# ── Step 4: Device info ────────────────────────────────────────────────────────
+
+def check_device_info() -> bool:
+    print(head("Step 4 — Device info"))
+    from pyorbbecsdk import Context, OBLogLevel  # type: ignore
+    Context.set_logger_to_console(OBLogLevel.ERROR)
+    ctx = Context()
+    device = ctx.query_devices().get_device_by_index(0)
+    info = device.get_device_info()
+    print(ok(f"Name      : {info.get_name()}"))
+    print(ok(f"Serial    : {info.get_serial_number()}"))
+    print(ok(f"Firmware  : {info.get_firmware_version()}"))
+    print(ok(f"USB PID   : 0x{info.get_pid():04X}"))
+    return True
 
 
 # ── Step 5: Depth stream ───────────────────────────────────────────────────────
 
 def check_depth_stream() -> bool:
     print(head("Step 5 — Depth stream"))
-    from openni import openni2
+    from pyorbbecsdk import Context, Pipeline, OBLogLevel  # type: ignore
     import numpy as np
+    Context.set_logger_to_console(OBLogLevel.ERROR)
+    ctx     = Context()
+    device  = ctx.query_devices().get_device_by_index(0)
+    pipeline = Pipeline(device)
     try:
-        device = openni2.Device.open_any()
-        depth  = device.create_depth_stream()
-        depth.start()
-        frame  = depth.read_frame()
-        w, h   = frame.width, frame.height
-        data   = np.frombuffer(frame.get_buffer_as_uint16(), dtype=np.uint16).reshape(h, w)
-        valid  = data[data > 0]
-        pct    = 100 * len(valid) / data.size
-        rng    = f"{int(valid.min())}–{int(valid.max())} mm" if len(valid) else "n/a"
-        depth.stop()
-        device.close()
+        pipeline.start()
+        frames = pipeline.wait_for_frames(3000)
+        if frames is None:
+            print(fail("No frames received within 3 s — point camera at a scene and retry."))
+            return False
+        depth_frame = frames.get_depth_frame()
+        if depth_frame is None:
+            print(fail("Depth frame is None — camera may not support depth on this mode."))
+            return False
+        w     = depth_frame.get_width()
+        h     = depth_frame.get_height()
+        scale = depth_frame.get_depth_scale()
+        data  = np.frombuffer(depth_frame.get_data(), dtype=np.uint16).reshape(h, w)
+        depth_mm = data.astype(np.float32) * scale
+        valid = depth_mm[depth_mm > 0]
+        pct   = 100 * len(valid) / depth_mm.size
+        rng   = f"{int(valid.min())}–{int(valid.max())} mm" if len(valid) else "n/a"
         print(ok(f"Frame {w}×{h}  valid={pct:.1f}%  range={rng}"))
         if pct < 20:
             print(warn("Low valid pixels — point camera at something within 3 m."))
@@ -246,11 +180,7 @@ def check_depth_stream() -> bool:
         print(fail(f"Depth stream error: {exc}"))
         return False
     finally:
-        try:
-            from openni import openni2 as _o
-            _o.unload()
-        except Exception:
-            pass
+        pipeline.stop()
 
 
 # ── Summary ────────────────────────────────────────────────────────────────────
@@ -258,11 +188,11 @@ def check_depth_stream() -> bool:
 def summary(results: dict[str, bool | None]) -> None:
     print(head("Summary"))
     labels = {
-        "usb":     "USB device detected",
-        "runtime": "OpenNI2 runtime found",
-        "init":    "SDK initialised",
-        "device":  "Camera opened",
-        "depth":   "Depth stream readable",
+        "usb":    "USB device detected",
+        "pkg":    "pyorbbecsdk2 installed",
+        "found":  "Device found by SDK",
+        "info":   "Device info read",
+        "depth":  "Depth stream readable",
     }
     all_pass = True
     for key, label in labels.items():
@@ -277,38 +207,25 @@ def summary(results: dict[str, bool | None]) -> None:
     print()
     if all_pass:
         print(f"{_GREEN}{_BOLD}Camera ready.{_RESET}")
-        if _IS_WINDOWS:
-            print("    run.bat --scene wall_approach")
-        else:
-            print("    python3 main.py --source orbbec --sink sim")
+        print("    run.bat --source orbbec --scene wall_approach" if _IS_WINDOWS
+              else "    python3 main.py --source orbbec --sink sim")
     else:
-        print(f"{_YELLOW}{_BOLD}Camera not ready.{_RESET}  Fix the ✗ items, then re-run:")
-        if _IS_WINDOWS:
-            print("    check_camera.bat")
-        else:
-            print("    python3 check_camera.py")
+        print(f"{_YELLOW}{_BOLD}Not ready.{_RESET}  Fix the ✗ items, then re-run:")
+        print("    check_camera.bat" if _IS_WINDOWS else "    python3 check_camera.py")
 
 
 # ── Entry point ────────────────────────────────────────────────────────────────
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="Orbbec Astra Pro Plus diagnostic")
-    ap.add_argument(
-        "--sdk-path", type=Path, default=None,
-        help=f"Directory containing {_LIB_NAME}",
-    )
-    args = ap.parse_args()
-
     print(f"{_BOLD}Orbbec Astra Pro Plus — camera diagnostic{_RESET}")
     print(f"{platform.system()} {platform.machine()}")
 
     results: dict[str, bool | None] = {}
-    results["usb"]     = check_usb()
-    lib_dir            = check_openni2_runtime(args.sdk_path)
-    results["runtime"] = lib_dir is not None
-    results["init"]    = check_sdk_init(lib_dir)   if lib_dir           else None
-    results["device"]  = check_device_open()        if results["init"]   else None
-    results["depth"]   = check_depth_stream()       if results["device"] else None
+    results["usb"]   = check_usb()
+    results["pkg"]   = check_package()
+    results["found"] = check_device_found()  if results["pkg"]   else None
+    results["info"]  = check_device_info()   if results["found"] else None
+    results["depth"] = check_depth_stream()  if results["info"]  else None
 
     summary(results)
 

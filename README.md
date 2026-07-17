@@ -11,7 +11,7 @@ Depth-to-haptic pipeline. Runs fully without hardware (simulated camera, termina
 
 ```
 1. Download the release ZIP from the Releases page and extract it anywhere.
-2. Double-click  setup.bat  — installs numpy, pyyaml, openni via pip
+2. Double-click  setup.bat  — installs numpy, pyyaml, pyorbbecsdk2 via pip
 3. Open a terminal in the folder and run a scene:
 ```
 
@@ -56,43 +56,34 @@ run.bat --scene wall_approach --step
 
 ## Camera setup — Windows (Orbbec Astra Pro Plus)
 
-**Step 1 — Install the Orbbec OpenNI2 SDK**
+No separate SDK download needed — `setup.bat` already installs everything.
 
-Download the Windows installer from:
-https://github.com/orbbec/OpenNI2/releases
-
-Run the `.exe`. It installs the driver and sets the `OPENNI2_REDIST64` environment variable automatically — no manual path configuration needed.
-
-**Step 2 — Plug in the camera and verify**
+Plug in the camera, then run:
 
 ```bat
 check_camera.bat
 ```
 
-Expected output when everything is working:
+Expected output when working:
 ```
 ✓ USB device detected
-✓ OpenNI2 runtime found
-✓ SDK initialised
-✓ Camera opened
+✓ pyorbbecsdk2 installed
+✓ Device found by SDK
+✓ Device info read
 ✓ Depth stream readable
 ```
 
-If Device 4 shows an error in Device Manager, re-run the Orbbec installer and select "Repair".
+If the device shows a yellow warning in Device Manager, right-click it → "Update driver" → "Search automatically".
 
 ---
 
-## Camera setup — Ubuntu (reference)
+## Camera setup — Linux (reference)
 
 ```bash
-sudo apt install libopenni2-0 openni2-utils usbutils
-pip3 install numpy pyyaml openni
-python3 check_camera.py
-```
-
-If the camera is detected on USB but the device won't open:
-```bash
+sudo apt install usbutils
+pip3 install numpy pyyaml pyorbbecsdk2
 sudo usermod -aG plugdev $USER   # log out and back in after this
+python3 check_camera.py
 ```
 
 ---
@@ -108,9 +99,9 @@ test.bat
 ## What changes when the real camera is wired in
 
 Replace `MockSource` with an `OrbecSource(DepthSource)` class that:
-- Calls `openni2.Device.open_any()` and starts a depth stream
-- Reads one frame per `get_grid()` call
+- Uses `pyorbbecsdk`: `Context` → `query_devices()` → `Pipeline` → `wait_for_frames()`
+- Reads one depth frame per `get_grid()` call
 - Averages depth pixels within each of the 8×2 spatial patches
-- Returns `np.nan` where the SDK reports zero or out-of-range pixels
+- Returns `np.nan` where `depth_mm == 0` (camera reports invalid/out-of-range)
 
 No other file changes needed — `Encoder`, `SimDisplay`, and `main.py` are hardware-agnostic.
