@@ -9,5 +9,6 @@ echo Python not found. Run setup.bat first.
 pause & exit /b 1
 
 :run
-%PYEXE% main.py %*
+pip install pytest >nul 2>&1
+%PYEXE% -m pytest tests/ -v %*
 endlocal

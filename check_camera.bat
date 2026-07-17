@@ -9,5 +9,5 @@ echo Python not found. Run setup.bat first.
 pause & exit /b 1
 
 :run
-%PYEXE% main.py %*
+%PYEXE% check_camera.py %*
 endlocal

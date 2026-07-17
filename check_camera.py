@@ -280,10 +280,13 @@ def summary(results: dict[str, bool | None]) -> None:
         if _IS_WINDOWS:
             print("    run.bat --scene wall_approach")
         else:
-            print("    python main.py --source orbbec --sink sim")
+            print("    python3 main.py --source orbbec --sink sim")
     else:
         print(f"{_YELLOW}{_BOLD}Camera not ready.{_RESET}  Fix the ✗ items, then re-run:")
-        print("    python check_camera.py")
+        if _IS_WINDOWS:
+            print("    check_camera.bat")
+        else:
+            print("    python3 check_camera.py")
 
 
 # ── Entry point ────────────────────────────────────────────────────────────────

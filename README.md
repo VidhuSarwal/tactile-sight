@@ -6,11 +6,12 @@ Depth-to-haptic pipeline. Runs fully without hardware (simulated camera, termina
 
 ## Quick start — Windows (no camera needed)
 
-**Requirements:** Python 3.10+ — download from https://www.python.org/downloads/ (tick "Add to PATH" during install)
+**Requirements:** Python 3.10+ — https://www.python.org/downloads/
+(the `python` command doesn't need to be in PATH — the bat files find it automatically)
 
 ```
 1. Download the release ZIP from the Releases page and extract it anywhere.
-2. Double-click  setup.bat  (installs numpy, pyyaml, openni)
+2. Double-click  setup.bat  — installs numpy, pyyaml, openni via pip
 3. Open a terminal in the folder and run a scene:
 ```
 
@@ -21,7 +22,7 @@ run.bat --scene person_crossing
 run.bat --scene all_clear
 ```
 
-Press `Ctrl-C` to stop. That's it — no camera, no drivers, nothing else needed.
+Press `Ctrl-C` to stop. No camera, no drivers, nothing else needed.
 
 ---
 
@@ -65,7 +66,7 @@ Run the `.exe`. It installs the driver and sets the `OPENNI2_REDIST64` environme
 **Step 2 — Plug in the camera and verify**
 
 ```bat
-python check_camera.py
+check_camera.bat
 ```
 
 Expected output when everything is working:
@@ -99,7 +100,7 @@ sudo usermod -aG plugdev $USER   # log out and back in after this
 ## Running tests
 
 ```bat
-python -m pytest tests/ -v
+test.bat
 ```
 
 ---
