@@ -32,10 +32,9 @@ echo "=== TactileSight board setup ==="
 # ── 1. System dependencies ────────────────────────────────────────────────────
 echo "[1/7] Installing system deps..."
 sudo apt-get update -qq
-sudo apt-get install -y unrar python3-pip
+sudo apt-get install -y unrar python3-pip python3-opencv python3-numpy
 pip3 install --quiet pillow
-# numpy — prefer apt to avoid build-from-source on arm64
-sudo apt-get install -y python3-numpy || pip3 install --quiet numpy
+pip3 install --break-system-packages --quiet onnxruntime
 
 # ── 2. OpenNI SDK ─────────────────────────────────────────────────────────────
 echo "[2/7] OpenNI SDK..."
@@ -119,10 +118,17 @@ sudo systemctl stop adbd.service    2>/dev/null || true
 echo "  done"
 
 # ── 7. Deploy haptic server ───────────────────────────────────────────────────
-echo "[7/7] Deploying haptic server..."
+echo "[7/7] Deploying haptic server + YOLO worker..."
 cp "$ARDUINO_HOME/haptic_depth_server.py" "$ARDUINO_HOME/haptic_depth_server.py.bak" 2>/dev/null || true
 cp "$(dirname "$0")/haptic_depth_server.py" "$ARDUINO_HOME/haptic_depth_server.py" 2>/dev/null \
-    || cp "$ARDUINO_HOME/haptic_depth_server.py" "$ARDUINO_HOME/haptic_depth_server.py"
+    || true
+cp "$(dirname "$0")/yolo_worker.py" "$ARDUINO_HOME/yolo_worker.py" 2>/dev/null || true
+
+# YOLO models
+mkdir -p "$ARDUINO_HOME/models"
+for f in "$(dirname "$0")/models/"*.onnx; do
+    [ -f "$f" ] && cp "$f" "$ARDUINO_HOME/models/" && echo "  copied model: $(basename $f)"
+done
 
 sudo cp "$ARDUINO_HOME/haptic-demo.service" /etc/systemd/system/haptic-demo.service
 sudo systemctl daemon-reload
