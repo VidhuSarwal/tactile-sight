@@ -67,10 +67,16 @@ _tune = {
 }
 
 # MJPEG depth stream
-_jpg_lock      = threading.Lock()
-_depth_jpg     = None
+_jpg_lock       = threading.Lock()
+_depth_jpg      = None
 _mjpeg_cli_lock = threading.Lock()
 _mjpeg_clients  = 0
+
+# Raw frame shared between camera_loop and the MJPEG encoder thread.
+# camera_loop drops a copy here (fast); encoder thread picks it up and encodes (slow).
+# This keeps JPEG work off the depth processing thread entirely.
+_raw_frame_lock = threading.Lock()
+_raw_frame_d    = None
 
 # YOLO worker
 _yolo_lock    = threading.Lock()
@@ -142,6 +148,43 @@ def colorize_depth(d_u16):
     b = np.zeros(d_u16.shape, dtype=np.uint8)
     r[blind] = 70; g[blind] = 70; b[blind] = 70
     return np.stack([r, g, b], axis=2)
+
+
+# ── MJPEG encoder thread ─────────────────────────────────────────────────────
+
+def mjpeg_encoder_loop():
+    """
+    Encodes colorized depth frames in a dedicated thread so camera_loop is never
+    blocked by PIL/JPEG work (~15ms per frame on Kryo 260).
+    Runs at 10fps (100ms sleep) — enough for a debug view.
+    """
+    global _depth_jpg
+    while True:
+        with _mjpeg_cli_lock:
+            has_clients = _mjpeg_clients > 0
+
+        if not has_clients:
+            time.sleep(0.1)
+            continue
+
+        with _raw_frame_lock:
+            d = _raw_frame_d  # just grab the reference (numpy array or None)
+
+        if d is None:
+            time.sleep(0.1)
+            continue
+
+        try:
+            rgb = colorize_depth(d)
+            img = Image.fromarray(rgb, 'RGB')
+            buf = _io.BytesIO()
+            img.save(buf, format='JPEG', quality=50)
+            with _jpg_lock:
+                _depth_jpg = buf.getvalue()
+        except Exception:
+            pass
+
+        time.sleep(0.1)  # 10fps
 
 
 # ── YOLO bbox → grid cell mapping ────────────────────────────────────────────
@@ -327,19 +370,14 @@ def process_frame(frame_bytes, w, h):
         _hfps_count = 0
         _hfps_ts    = now
 
-    # MJPEG: only colorize when a browser is watching (prevents 90MB/s alloc churn)
-    with _mjpeg_cli_lock:
-        has_clients = _mjpeg_clients > 0
-    if _MJPEG and has_clients and _hist_i % 2 == 0:
-        try:
-            rgb = colorize_depth(d)
-            img = Image.fromarray(rgb, 'RGB')
-            buf = _io.BytesIO()
-            img.save(buf, format='JPEG', quality=55)
-            with _jpg_lock:
-                _depth_jpg = buf.getvalue()
-        except Exception:
-            pass
+    # Hand a copy of the raw frame to the MJPEG encoder thread.
+    # The copy (~0.3ms) is all we do here — actual JPEG encoding happens off this thread.
+    if _MJPEG:
+        with _mjpeg_cli_lock:
+            has_clients = _mjpeg_clients > 0
+        if has_clients:
+            with _raw_frame_lock:
+                _raw_frame_d = d.copy()
 
     # Periodic GC to release allocator-held pages from numpy operations
     if _hist_i % 100 == 0:
@@ -959,8 +997,9 @@ if __name__ == "__main__":
     if not _MJPEG:
         log("WARNING: pillow not found — /depth.mjpg disabled. Fix: pip3 install pillow")
 
-    threading.Thread(target=camera_loop,    daemon=True).start()
-    threading.Thread(target=det_reader_loop, daemon=True).start()
+    threading.Thread(target=camera_loop,      daemon=True).start()
+    threading.Thread(target=det_reader_loop,  daemon=True).start()
+    threading.Thread(target=mjpeg_encoder_loop, daemon=True).start()
 
     log(f"TactileSight v5 at http://10.221.208.1:8081")
     log(f"  depth safety net: always on")
