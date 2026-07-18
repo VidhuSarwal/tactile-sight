@@ -48,8 +48,10 @@ _status    = ["starting..."]
 _hist   = [[float(DETECT_MM)] * HIST_FRAMES for _ in range(N_CELLS)]
 _hist_i = 0
 
-_jpg_lock  = threading.Lock()
-_depth_jpg = None   # latest colorized depth frame as JPEG bytes, or None
+_jpg_lock       = threading.Lock()
+_depth_jpg      = None   # latest colorized depth frame as JPEG bytes, or None
+_mjpeg_cli_lock = threading.Lock()
+_mjpeg_clients  = 0     # number of browsers watching /depth.mjpg right now
 
 log = lambda m: print(f"[srv] {m}", flush=True)
 
@@ -105,7 +107,10 @@ def process_frame(frame_bytes, w, h):
             level = (DETECT_MM - med) / DETECT_MM * 255.0
             levels.append(min(255.0, max(0.0, level))); raw_out.append(int(med))
 
-    if _MJPEG and _hist_i % 2 == 0:
+    # Only encode JPEG when a browser is actually watching — prevents 3GB RAM bloat
+    with _mjpeg_cli_lock:
+        has_clients = _mjpeg_clients > 0
+    if _MJPEG and has_clients and _hist_i % 2 == 0:
         try:
             rgb = colorize_depth(d)
             img = Image.fromarray(rgb, 'RGB')
@@ -407,6 +412,7 @@ class Handler(BaseHTTPRequestHandler):
             self._send(404, "text/plain", "not found")
 
     def _stream_mjpeg(self):
+        global _mjpeg_clients
         if not _MJPEG:
             self._send(503, "text/plain",
                 "pillow not installed — run: pip3 install pillow")
@@ -416,6 +422,8 @@ class Handler(BaseHTTPRequestHandler):
             "multipart/x-mixed-replace; boundary=frame")
         self.send_header("Cache-Control", "no-cache")
         self.end_headers()
+        with _mjpeg_cli_lock:
+            _mjpeg_clients += 1
         try:
             while True:
                 with _jpg_lock:
@@ -432,6 +440,9 @@ class Handler(BaseHTTPRequestHandler):
                 time.sleep(0.066)  # ~15 fps
         except Exception:
             pass
+        finally:
+            with _mjpeg_cli_lock:
+                _mjpeg_clients -= 1
 
     def do_POST(self):
         if self.path == '/toggle':
