@@ -64,10 +64,12 @@ _hist      = [[float(DETECT_MM)] * HIST_FRAMES for _ in range(N_CELLS)]
 _hist_i    = 0
 
 # ── MJPEG stream ───────────────────────────────────────────────────────────────
-_jpg_lock       = threading.Lock()
-_depth_jpg      = None
-_mjpeg_cli_lock = threading.Lock()
-_mjpeg_clients  = 0
+# camera_loop writes raw uint16 bytes here; _stream_mjpeg() encodes JPEG itself
+# so PIL never runs on the camera thread (GIL kept free for HTTP handlers)
+_jpg_lock         = threading.Lock()
+_depth_raw_mjpeg  = None   # latest raw depth bytes for MJPEG encoding
+_mjpeg_cli_lock   = threading.Lock()
+_mjpeg_clients    = 0
 
 # ── snapshot / capture state ───────────────────────────────────────────────────
 _snap_lock      = threading.Lock()
@@ -144,18 +146,12 @@ def process_frame(frame_bytes, w, h):
             level = (DETECT_MM - med) / DETECT_MM * 255.0
             levels.append(min(255.0, max(0.0, level))); raw_out.append(int(med))
 
+    # Share raw bytes for MJPEG — encoding happens in handler thread, not here
     with _mjpeg_cli_lock:
         has_clients = _mjpeg_clients > 0
-    if _MJPEG and has_clients and _hist_i % 2 == 0:
-        try:
-            rgb = colorize_depth(d)
-            img = Image.fromarray(rgb, 'RGB')
-            buf = _io.BytesIO()
-            img.save(buf, format='JPEG', quality=55)
-            with _jpg_lock:
-                _depth_jpg = buf.getvalue()
-        except Exception:
-            pass
+    if _MJPEG and has_clients:
+        with _jpg_lock:
+            _depth_raw_mjpeg = frame_bytes   # already a bytes copy from ctypes.string_at
 
     return levels, raw_out
 
@@ -690,23 +686,35 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-Type", "multipart/x-mixed-replace; boundary=frame")
         self.send_header("Cache-Control", "no-cache")
+        self.send_header("Connection", "close")
         self.end_headers()
         with _mjpeg_cli_lock:
             _mjpeg_clients += 1
+        last_raw = None
         try:
             while True:
                 with _jpg_lock:
-                    jpg = _depth_jpg
-                if jpg:
-                    part = (
-                        b"--frame\r\n"
-                        b"Content-Type: image/jpeg\r\n"
-                        b"Content-Length: " + str(len(jpg)).encode() + b"\r\n"
-                        b"\r\n" + jpg + b"\r\n"
-                    )
-                    self.wfile.write(part)
-                    self.wfile.flush()
-                time.sleep(0.066)
+                    raw = _depth_raw_mjpeg
+                if raw and raw is not last_raw:
+                    last_raw = raw
+                    try:
+                        d   = np.frombuffer(raw, dtype=np.uint16).reshape(480, 640)
+                        rgb = colorize_depth(d)
+                        img = Image.fromarray(rgb, 'RGB')
+                        buf = _io.BytesIO()
+                        img.save(buf, format='JPEG', quality=55)
+                        jpg = buf.getvalue()
+                        part = (
+                            b"--frame\r\n"
+                            b"Content-Type: image/jpeg\r\n"
+                            b"Content-Length: " + str(len(jpg)).encode() + b"\r\n"
+                            b"\r\n" + jpg + b"\r\n"
+                        )
+                        self.wfile.write(part)
+                        self.wfile.flush()
+                    except Exception:
+                        pass
+                time.sleep(0.1)   # encode at most 10fps, camera runs at 30fps
         except Exception:
             pass
         finally:
