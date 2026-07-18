@@ -1,18 +1,23 @@
 #!/usr/bin/env python3
 """
-TactileSight depth->haptic server  v4
-  GET /          -> haptic grid web UI (USB toggle + depth cam toggle)
-  GET /grid      -> JSON {grid, raw_mm, status, usb_mode}
-  GET /depth.mjpg -> colorized depth MJPEG stream (needs pillow: pip3 install pillow)
-  POST /toggle   -> flip USB-C host<->device
-  Port 8081
+TactileSight depth->haptic server  v5
+  GET /           -> haptic grid web UI (USB toggle + depth cam + capture button)
+  GET /grid       -> JSON {grid, raw_mm, status, usb_mode}
+  GET /depth.mjpg -> colorized depth MJPEG stream (needs pillow)
+  POST /toggle    -> flip USB-C host<->device (power-cycles camera when going to host)
+  POST /capture   -> one-shot: grab rgb.jpg + depth.png + meta.json, push via WebSocket
+  WS  :8083       -> JSON bundle {ts, rgb_b64, depth_b64} sent once per /capture call
+  Port 8081 (HTTP) + 8083 (WebSocket)
 
 Sensing: 21 cells (3 rows x 7 cols), each like an independent ultrasonic sensor.
   - DETECT_MM: alert range ceiling; beyond this = silence
   - Close obstacle = 255 (strong haptic), open/sky/no-return = 0 (silence)
   - 5-frame per-cell temporal median kills structured-light jitter
+
+CRITICAL: Never import cv2 in this process — causes SIGSEGV with OpenNI2 ctypes.
+          cv2 lives exclusively in rgb_worker.py (subprocess).
 """
-import os, ctypes, threading, struct, time, json, subprocess
+import os, ctypes, threading, struct, time, json, subprocess, asyncio, base64
 import numpy as np
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from socketserver import ThreadingMixIn
@@ -24,6 +29,12 @@ try:
 except ImportError:
     _MJPEG = False
 
+try:
+    import websockets as _wslib
+    _WS = True
+except ImportError:
+    _WS = False
+
 NIDIR = os.path.expanduser(
     "~/OpenNI_SDK/OpenNI_2.3.0.86_202210111155_4c8f5aa4_beta6_a311d/tools/NiViewer")
 os.chdir(NIDIR)
@@ -31,29 +42,57 @@ os.environ.setdefault("LD_LIBRARY_PATH", NIDIR)
 
 ROLE_PATH = ("/sys/devices/platform/soc@0/4ef8800.usb/4e00000.usb"
              "/usb_role/4e00000.usb-role-switch/role")
+SHM_DIR   = "/dev/shm/tactile"
 COLS, ROWS = 7, 3
 N_CELLS    = COLS * ROWS
 
-DETECT_MM       = 2000   # objects beyond this are silence
-NEAR_FLOOR_MM   = 350    # structured-light blind zone; discard below this
-CELL_PERCENTILE = 20     # 20th pct of valid pixels per cell = nearest real point
-MIN_VALID_FRAC  = 0.08   # at least 8% valid pixels needed per cell
-HIST_FRAMES     = 5      # temporal median window
+DETECT_MM       = 2000
+NEAR_FLOOR_MM   = 350
+CELL_PERCENTILE = 20
+MIN_VALID_FRAC  = 0.08
+HIST_FRAMES     = 5
 
+# ── haptic grid state ──────────────────────────────────────────────────────────
 _grid_lock = threading.Lock()
 _grid      = [0.0] * N_CELLS
 _raw_mm    = [0]   * N_CELLS
 _status    = ["starting..."]
+_hist      = [[float(DETECT_MM)] * HIST_FRAMES for _ in range(N_CELLS)]
+_hist_i    = 0
 
-_hist   = [[float(DETECT_MM)] * HIST_FRAMES for _ in range(N_CELLS)]
-_hist_i = 0
-
+# ── MJPEG stream ───────────────────────────────────────────────────────────────
 _jpg_lock       = threading.Lock()
-_depth_jpg      = None   # latest colorized depth frame as JPEG bytes, or None
+_depth_jpg      = None
 _mjpeg_cli_lock = threading.Lock()
-_mjpeg_clients  = 0     # number of browsers watching /depth.mjpg right now
+_mjpeg_clients  = 0
+
+# ── snapshot / capture state ───────────────────────────────────────────────────
+_snap_lock      = threading.Lock()
+_snap_requested = False       # HTTP /capture handler sets; camera_loop clears
+_snap_ready_evt = threading.Event()
+_snap_depth_raw = None        # bytes 640×480×2, set by camera_loop
+_snap_ts        = 0.0
+
+# ── WebSocket server state ─────────────────────────────────────────────────────
+_ws_loop         = None       # asyncio event loop running in ws_server_loop thread
+_ws_clients      = set()
+_ws_clients_lock = threading.Lock()
 
 log = lambda m: print(f"[srv] {m}", flush=True)
+
+try:
+    import io as _png_io, png as _png_lib
+    def encode_depth_png(raw_bytes):
+        arr = np.frombuffer(raw_bytes, dtype=np.uint16).reshape(480, 640)
+        buf = _png_io.BytesIO()
+        _png_lib.Writer(width=640, height=480, bitdepth=16, greyscale=True).write(
+            buf, arr.tolist())
+        return buf.getvalue()
+    _HAVE_PNG = True
+except ImportError:
+    _HAVE_PNG = False
+    def encode_depth_png(_):
+        return b''
 
 
 def get_usb_mode():
@@ -64,30 +103,25 @@ def get_usb_mode():
 
 
 def colorize_depth(d_u16):
-    """Depth uint16 -> RGB: near=red, far=green, invalid/beyond=black, blind zone=grey."""
     valid = (d_u16 >= NEAR_FLOOR_MM) & (d_u16 < DETECT_MM)
     blind = d_u16 < NEAR_FLOOR_MM
-
-    norm = np.where(valid,
+    norm  = np.where(valid,
         np.clip((d_u16.astype(np.float32) - NEAR_FLOOR_MM) / (DETECT_MM - NEAR_FLOOR_MM), 0, 1),
         0.0)
-
     r = np.where(valid, np.clip((1.0 - norm) * 255, 0, 255), 0).astype(np.uint8)
     g = np.where(valid, np.clip(norm * 220, 0, 255), 0).astype(np.uint8)
     b = np.zeros(d_u16.shape, dtype=np.uint8)
-
     r[blind] = 70; g[blind] = 70; b[blind] = 70
-
     return np.stack([r, g, b], axis=2)
 
 
 def process_frame(frame_bytes, w, h):
-    global _hist_i, _depth_jpg
+    global _hist_i
     d = np.frombuffer(frame_bytes, dtype=np.uint16).reshape(h, w)
     ch, cw = h // ROWS, w // COLS
 
     for idx in range(N_CELLS):
-        r, c = divmod(idx, COLS)
+        r, c  = divmod(idx, COLS)
         cell  = d[r*ch:(r+1)*ch, c*cw:(c+1)*cw]
         valid = cell[cell >= NEAR_FLOOR_MM]
         min_px = max(5, int(cell.size * MIN_VALID_FRAC))
@@ -107,7 +141,6 @@ def process_frame(frame_bytes, w, h):
             level = (DETECT_MM - med) / DETECT_MM * 255.0
             levels.append(min(255.0, max(0.0, level))); raw_out.append(int(med))
 
-    # Only encode JPEG when a browser is actually watching — prevents 3GB RAM bloat
     with _mjpeg_cli_lock:
         has_clients = _mjpeg_clients > 0
     if _MJPEG and has_clients and _hist_i % 2 == 0:
@@ -116,9 +149,8 @@ def process_frame(frame_bytes, w, h):
             img = Image.fromarray(rgb, 'RGB')
             buf = _io.BytesIO()
             img.save(buf, format='JPEG', quality=55)
-            jpg = buf.getvalue()
             with _jpg_lock:
-                _depth_jpg = jpg
+                _depth_jpg = buf.getvalue()
         except Exception:
             pass
 
@@ -126,31 +158,34 @@ def process_frame(frame_bytes, w, h):
 
 
 def camera_loop():
+    global _snap_requested, _snap_depth_raw, _snap_ts
     lib_path = os.path.join(NIDIR, "libOpenNI2.so")
+    lib = ctypes.CDLL(lib_path)
+    lib.oniInitialize.restype         = ctypes.c_int
+    lib.oniDeviceOpen.restype         = ctypes.c_int
+    lib.oniDeviceClose.restype        = ctypes.c_int
+    lib.oniDeviceCreateStream.restype = ctypes.c_int
+    lib.oniStreamStart.restype        = ctypes.c_int
+    lib.oniStreamStop.restype         = None
+    lib.oniStreamDestroy.restype      = None
+    lib.oniStreamReadFrame.restype    = ctypes.c_int
+    lib.oniWaitForAnyStream.restype   = ctypes.c_int
+    lib.oniFrameRelease.restype       = None
+
+    _status[0] = "initializing OpenNI2..."
+    log(_status[0])
+    if lib.oniInitialize(2) != 0:
+        log("oniInitialize failed — camera_loop exiting")
+        return
+
     while True:
-        lib = None
+        dev    = ctypes.c_void_p()
+        stream = ctypes.c_void_p()
         try:
-            lib = ctypes.CDLL(lib_path)
-            lib.oniInitialize.restype         = ctypes.c_int
-            lib.oniDeviceOpen.restype         = ctypes.c_int
-            lib.oniDeviceCreateStream.restype = ctypes.c_int
-            lib.oniStreamStart.restype        = ctypes.c_int
-            lib.oniStreamReadFrame.restype    = ctypes.c_int
-            lib.oniFrameRelease.restype       = None
-            lib.oniShutdown.restype           = None
-
-            _status[0] = "initializing OpenNI2..."
-            log(_status[0])
-            if lib.oniInitialize(2) != 0:
-                raise RuntimeError("oniInitialize failed")
-
             _status[0] = "opening depth device..."
-            log(_status[0])
-            dev = ctypes.c_void_p()
             if lib.oniDeviceOpen(None, ctypes.byref(dev)) != 0:
                 raise RuntimeError("no camera — retrying...")
 
-            stream = ctypes.c_void_p()
             if lib.oniDeviceCreateStream(dev, 3, ctypes.byref(stream)) != 0:
                 raise RuntimeError("oniDeviceCreateStream(depth=3) failed")
             if lib.oniStreamStart(stream) != 0:
@@ -165,9 +200,18 @@ def camera_loop():
 
             _status[0] = "streaming"
             log(f"depth->haptic active | range 0-{DETECT_MM}mm | {HIST_FRAMES}-frame median"
-                + (" | MJPEG stream ready" if _MJPEG else " | (install pillow for MJPEG stream)"))
+                + (" | MJPEG ready" if _MJPEG else "")
+                + (" | WS capture ready" if _WS else ""))
+
+            streams_arr = (ctypes.c_void_p * 1)(stream.value)
+            stream_idx  = ctypes.c_int(-1)
 
             while True:
+                rc_wait = lib.oniWaitForAnyStream(streams_arr, 1,
+                                                  ctypes.byref(stream_idx), 500)
+                if rc_wait != 0:
+                    raise RuntimeError(f"stream lost (rc={rc_wait}) — USB disconnected?")
+
                 frame = ctypes.c_void_p()
                 rc = lib.oniStreamReadFrame(stream, ctypes.byref(frame))
                 if rc != 0 or not frame.value:
@@ -188,21 +232,128 @@ def camera_loop():
                     with _grid_lock:
                         _grid[:]   = levels
                         _raw_mm[:] = raw_mm
+                    # v5: snapshot hook — zero OpenNI2 calls, safe
+                    with _snap_lock:
+                        if _snap_requested:
+                            _snap_depth_raw = raw
+                            _snap_ts        = time.time()
+                            _snap_requested = False
+                            _snap_ready_evt.set()
                 else:
                     lib.oniFrameRelease(ctypes.byref(frame))
 
         except Exception as e:
             _status[0] = f"waiting for camera ({e})"
             log(f"camera: {e}")
-            if lib:
-                try: lib.oniShutdown()
+        finally:
+            if stream.value:
+                try: lib.oniStreamStop(stream)
+                except Exception: pass
+                try: lib.oniStreamDestroy(stream)
+                except Exception: pass
+            if dev.value:
+                try: lib.oniDeviceClose(dev)
                 except Exception: pass
             with _grid_lock:
                 _grid[:]   = [0.0] * N_CELLS
                 _raw_mm[:] = [0]   * N_CELLS
-            log("retry in 5s...")
-            time.sleep(5)
+        log("retry in 5s...")
+        time.sleep(5)
 
+
+# ── WebSocket server ───────────────────────────────────────────────────────────
+
+async def _ws_handler(websocket):
+    with _ws_clients_lock:
+        _ws_clients.add(websocket)
+    log(f"ws client connected ({len(_ws_clients)} total)")
+    try:
+        await websocket.wait_closed()
+    finally:
+        with _ws_clients_lock:
+            _ws_clients.discard(websocket)
+        log(f"ws client disconnected ({len(_ws_clients)} remaining)")
+
+
+async def _broadcast(bundle):
+    with _ws_clients_lock:
+        targets = set(_ws_clients)
+    for ws in targets:
+        try:
+            await ws.send(bundle)
+        except Exception:
+            pass
+
+
+async def _ws_main():
+    global _ws_loop
+    _ws_loop = asyncio.get_running_loop()
+    log("ws capture server on :8083")
+    async with _wslib.serve(_ws_handler, "0.0.0.0", 8083):
+        await asyncio.Future()   # run forever
+
+
+def ws_server_loop():
+    if not _WS:
+        log("websockets not installed — capture WS unavailable. Fix: pip3 install websockets")
+        return
+    asyncio.run(_ws_main())
+
+
+def _do_capture():
+    """One-shot: grab depth + rgb, encode, broadcast. Called from HTTP handler thread."""
+    global _snap_requested
+    if not _ws_loop:
+        return {"ok": False, "error": "ws server not ready"}
+
+    # 1. Trigger rgb_worker
+    ts_now = time.time()
+    try:
+        with open(os.path.join(SHM_DIR, 'trigger.ts'), 'w') as f:
+            f.write(str(ts_now))
+    except Exception:
+        pass
+
+    # 2. Request depth frame from camera_loop
+    _snap_ready_evt.clear()
+    with _snap_lock:
+        _snap_requested = True
+    got = _snap_ready_evt.wait(timeout=3)
+
+    if not got:
+        log("capture: timeout — camera not streaming?")
+        return {"ok": False, "error": "camera not streaming"}
+
+    with _snap_lock:
+        d_raw = _snap_depth_raw
+        ts    = _snap_ts
+
+    # 3. Wait briefly for rgb_worker to flush its file
+    time.sleep(0.15)
+    try:
+        rgb_jpg = open(os.path.join(SHM_DIR, 'rgb.jpg'), 'rb').read()
+    except Exception:
+        rgb_jpg = b''
+
+    # 4. Encode and broadcast
+    try:
+        depth_png = encode_depth_png(d_raw)
+    except Exception as e:
+        log(f"capture: encode error: {e}")
+        depth_png = b''
+
+    bundle = json.dumps({
+        "ts":        ts,
+        "rgb_b64":   base64.b64encode(rgb_jpg).decode(),
+        "depth_b64": base64.b64encode(depth_png).decode(),
+    })
+    asyncio.run_coroutine_threadsafe(_broadcast(bundle), _ws_loop)
+    log(f"capture: sent {len(rgb_jpg)//1024}KB rgb + {len(depth_png)//1024}KB depth "
+        f"to {len(_ws_clients)} client(s)")
+    return {"ok": True}
+
+
+# ── HTML ───────────────────────────────────────────────────────────────────────
 
 HTML = r"""<!DOCTYPE html>
 <html lang="en">
@@ -231,11 +382,12 @@ HTML = r"""<!DOCTYPE html>
   .host    { background: #0d2e0d; color: #3f3; border: 1px solid #2a2; }
   .device  { background: #2e0d0d; color: #f33; border: 1px solid #a22; }
   .unknown { background: #1e1e1e; color: #888; border: 1px solid #444; }
-  #toggle-btn { padding: 6px 14px; border: 1px solid #444; background: #1a1a1a;
-                color: #aaa; border-radius: 4px; cursor: pointer;
-                font-family: monospace; font-size: 0.8rem; }
-  #toggle-btn:hover { background: #252525; }
-  #toggle-btn:disabled { opacity: 0.5; cursor: default; }
+  #toggle-btn, #cap-btn { padding: 6px 14px; border: 1px solid #444;
+                background: #1a1a1a; color: #aaa; border-radius: 4px;
+                cursor: pointer; font-family: monospace; font-size: 0.8rem; }
+  #toggle-btn:hover, #cap-btn:hover { background: #252525; }
+  #toggle-btn:disabled, #cap-btn:disabled { opacity: 0.5; cursor: default; }
+  #cap-btn.on { border-color: #3a3; color: #3f3; background: #0d1f0d; }
   #toggle-msg { font-size: 0.72rem; color: #666; margin-top: 6px;
                 min-height: 1.2em; max-width: 440px; text-align: center; }
   .meta-link { margin-top: 12px; font-size: 0.72rem; color: #444;
@@ -246,6 +398,16 @@ HTML = r"""<!DOCTYPE html>
                 border-radius: 4px; display: block; }
   #depth-label { font-size: 0.65rem; color: #444; text-align: center;
                  margin-top: 4px; }
+  #capture-bar { margin-top: 20px; display: flex; align-items: center;
+                 gap: 10px; font-size: 0.8rem; }
+  #snap-ts { font-size: 0.72rem; color: #555; }
+  #ws-status { font-size: 0.65rem; color: #444; }
+  #rgb-preview { margin-top: 12px; max-width: 320px; width: 100%;
+                 border: 1px solid #2a2a2a; border-radius: 4px;
+                 display: none; }
+  #dl-bar { margin-top: 8px; display: none; gap: 12px; font-size: 0.72rem; }
+  #dl-bar a { color: #4af; text-decoration: none; }
+  #dl-bar a:hover { color: #7cf; }
 </style>
 </head>
 <body>
@@ -268,6 +430,18 @@ HTML = r"""<!DOCTYPE html>
   <div id="depth-label">red = near (&lt;350mm) &nbsp;|&nbsp; yellow = mid &nbsp;|&nbsp; green = far (&gt;2m) &nbsp;|&nbsp; black = no return</div>
 </div>
 
+<div id="capture-bar">
+  <button id="cap-btn" onclick="doCapture()">[ capture ]</button>
+  <span id="snap-ts"></span>
+  <span id="ws-status">ws: connecting...</span>
+</div>
+<img id="rgb-preview" alt="rgb snapshot">
+<div id="dl-bar">
+  <a id="dl-rgb"   download="rgb.jpg">↓ rgb.jpg</a>
+  <a id="dl-depth" download="depth.png">↓ depth.png</a>
+  <a id="dl-meta"  download="meta.json">↓ meta.json</a>
+</div>
+
 <script>
 const statusEl   = document.getElementById('status');
 const modeBadge  = document.getElementById('mode-badge');
@@ -277,11 +451,18 @@ const gridEl     = document.getElementById('grid');
 const depthWrap  = document.getElementById('depth-wrap');
 const depthImg   = document.getElementById('depth-img');
 const depthToggle= document.getElementById('depth-toggle');
+const capBtn     = document.getElementById('cap-btn');
+const snapTs     = document.getElementById('snap-ts');
+const wsStatus   = document.getElementById('ws-status');
+const rgbPreview = document.getElementById('rgb-preview');
+const dlBar      = document.getElementById('dl-bar');
 
 let showDebug = false;
 let depthOn   = false;
+let capActive = false;
 let lastRaw   = [];
 
+// ── haptic grid ───────────────────────────────────────────────────────────────
 const dots = [];
 for (let i = 0; i < 21; i++) {
   const d = document.createElement('div');
@@ -335,7 +516,7 @@ function toggleDepth() {
     depthToggle.textContent = '[ hide depth cam ]';
   } else {
     depthWrap.style.display = 'none';
-    depthImg.src = '';   // closes MJPEG connection
+    depthImg.src = '';
     depthToggle.textContent = '[ show depth cam ]';
   }
 }
@@ -360,18 +541,75 @@ function poll() {
 }
 
 function doToggle() {
+  const goingToHost = (modeBadge.textContent !== 'host');
   toggleBtn.disabled = true;
-  toggleMsg.textContent = 'switching mode...';
+  toggleMsg.textContent = goingToHost ? 'power cycling camera (3s)...' : 'switching to device mode...';
   fetch('/toggle', { method: 'POST' }).then(r => r.json()).then(data => {
     const m = data.usb_mode;
     setMode(m);
     toggleMsg.textContent = m === 'device'
-      ? 'Device mode — connect USB-C to PC to program MCU. Click again to restore camera.'
-      : 'Host mode — camera will enumerate in a few seconds.';
+      ? 'Device mode — connect USB-C to PC. Click again to restore camera.'
+      : 'Host mode — depth stream starting in ~5s.';
     setTimeout(() => { toggleMsg.textContent = ''; }, 8000);
   }).catch(() => {
     toggleMsg.textContent = 'toggle failed — check server logs';
   }).finally(() => { toggleBtn.disabled = false; });
+}
+
+// ── WebSocket (auto-reconnecting) ─────────────────────────────────────────────
+let ws;
+function connectWS() {
+  ws = new WebSocket('ws://' + location.hostname + ':8083');
+  ws.onopen  = () => { wsStatus.textContent = 'ws: connected'; };
+  ws.onclose = () => {
+    wsStatus.textContent = 'ws: reconnecting...';
+    setTimeout(connectWS, 2000);
+  };
+  ws.onerror = () => {};   // onclose handles it
+
+  ws.onmessage = function(e) {
+    let d;
+    try { d = JSON.parse(e.data); } catch { return; }
+    if (d.rgb_b64) {
+      const rgbSrc = 'data:image/jpeg;base64,' + d.rgb_b64;
+      rgbPreview.src = rgbSrc;
+      rgbPreview.style.display = 'block';
+      document.getElementById('dl-rgb').href = rgbSrc;
+    }
+    if (d.depth_b64) {
+      document.getElementById('dl-depth').href =
+        'data:image/png;base64,' + d.depth_b64;
+    }
+    if (d.ts) {
+      document.getElementById('dl-meta').href =
+        'data:application/json;base64,' + btoa(JSON.stringify({ts: d.ts}));
+      snapTs.textContent = 'last: ' + new Date(d.ts * 1000).toLocaleTimeString();
+    }
+    dlBar.style.display = 'flex';
+    capBtn.disabled = false;
+    capBtn.textContent = '[ capture ]';
+  };
+}
+connectWS();
+
+function doCapture() {
+  capBtn.disabled = true;
+  capBtn.textContent = '[ capturing... ]';
+  fetch('/capture', { method: 'POST' })
+    .then(r => r.json())
+    .then(d => {
+      if (!d.ok) {
+        capBtn.disabled = false;
+        capBtn.textContent = '[ capture ]';
+        snapTs.textContent = 'failed: ' + (d.error || 'unknown');
+      }
+      // on success: button re-enabled when WS message arrives with the bundle
+    })
+    .catch(() => {
+      capBtn.disabled = false;
+      capBtn.textContent = '[ capture ]';
+      snapTs.textContent = 'request failed';
+    });
 }
 
 setInterval(poll, 100);
@@ -401,10 +639,10 @@ class Handler(BaseHTTPRequestHandler):
                 g  = list(_grid)
                 rm = list(_raw_mm)
             self._send(200, "application/json", json.dumps({
-                "grid":     g,
-                "raw_mm":   rm,
-                "status":   _status[0],
-                "usb_mode": get_usb_mode()
+                "grid":           g,
+                "raw_mm":         rm,
+                "status":         _status[0],
+                "usb_mode":       get_usb_mode(),
             }))
         elif self.path.startswith('/depth.mjpg'):
             self._stream_mjpeg()
@@ -418,8 +656,7 @@ class Handler(BaseHTTPRequestHandler):
                 "pillow not installed — run: pip3 install pillow")
             return
         self.send_response(200)
-        self.send_header("Content-Type",
-            "multipart/x-mixed-replace; boundary=frame")
+        self.send_header("Content-Type", "multipart/x-mixed-replace; boundary=frame")
         self.send_header("Cache-Control", "no-cache")
         self.end_headers()
         with _mjpeg_cli_lock:
@@ -437,7 +674,7 @@ class Handler(BaseHTTPRequestHandler):
                     )
                     self.wfile.write(part)
                     self.wfile.flush()
-                time.sleep(0.066)  # ~15 fps
+                time.sleep(0.066)
         except Exception:
             pass
         finally:
@@ -449,17 +686,25 @@ class Handler(BaseHTTPRequestHandler):
             current  = get_usb_mode()
             new_mode = "device" if current == "host" else "host"
             try:
-                subprocess.run(["sudo", "/usr/local/bin/usb-role", new_mode],
-                    check=True, timeout=5, capture_output=True)
-                svc_action = "enable" if new_mode == "host" else "disable"
-                subprocess.run(["sudo", "systemctl", svc_action,
-                    "usb-host-mode.service"],
-                    capture_output=True, timeout=5)
+                if new_mode == "host":
+                    subprocess.run(["sudo", "/usr/local/bin/usb-role", "device"],
+                        check=True, timeout=5, capture_output=True)
+                    time.sleep(3)
+                    subprocess.run(["sudo", "/usr/local/bin/usb-role", "host"],
+                        check=True, timeout=5, capture_output=True)
+                else:
+                    subprocess.run(["sudo", "/usr/local/bin/usb-role", "device"],
+                        check=True, timeout=5, capture_output=True)
                 log(f"USB toggled -> {new_mode}")
             except Exception as e:
                 log(f"toggle error: {e}")
             self._send(200, "application/json",
                 json.dumps({"usb_mode": get_usb_mode()}))
+
+        elif self.path == '/capture':
+            result = _do_capture()
+            self._send(200, "application/json", json.dumps(result))
+
         else:
             self._send(404, "text/plain", "not found")
 
@@ -471,9 +716,27 @@ class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
 if __name__ == "__main__":
     if not _MJPEG:
         log("WARNING: pillow not found — /depth.mjpg unavailable. Fix: pip3 install pillow")
-    t = threading.Thread(target=camera_loop, daemon=True)
-    t.start()
-    log(f"TactileSight server at http://10.221.208.1:8081  "
-        f"(detect: 0-{DETECT_MM}mm, median/{HIST_FRAMES}f)")
+    if not _WS:
+        log("WARNING: websockets not found — capture unavailable. Fix: pip3 install websockets")
+    if not _HAVE_PNG:
+        log("WARNING: png not found — depth.png will be empty. Fix: pip3 install pypng")
+
+    os.makedirs(SHM_DIR, exist_ok=True)
+
+    # rgb_worker subprocess — cv2 lives here, never imported in this process
+    rgb_worker_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                   "rgb_worker.py")
+    if os.path.exists(rgb_worker_path):
+        subprocess.Popen(["python3", rgb_worker_path],
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        log(f"rgb_worker started: {rgb_worker_path}")
+    else:
+        log(f"WARNING: rgb_worker.py not found — RGB capture disabled")
+
+    threading.Thread(target=camera_loop,    daemon=True).start()
+    threading.Thread(target=ws_server_loop, daemon=True).start()
+
+    log(f"TactileSight v5 | http://10.221.208.1:8081 | ws://10.221.208.1:8083"
+        f" | detect 0-{DETECT_MM}mm | median/{HIST_FRAMES}f")
     srv = ThreadedHTTPServer(("0.0.0.0", 8081), Handler)
     srv.serve_forever()

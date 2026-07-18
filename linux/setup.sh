@@ -34,7 +34,7 @@ echo "[1/7] Installing system deps..."
 sudo apt-get update -qq
 sudo apt-get install -y unrar python3-pip python3-opencv python3-numpy
 pip3 install --quiet pillow
-pip3 install --break-system-packages --quiet onnxruntime
+pip3 install --break-system-packages --quiet websockets pypng
 
 # ── 2. OpenNI SDK ─────────────────────────────────────────────────────────────
 echo "[2/7] OpenNI SDK..."
@@ -94,15 +94,15 @@ echo "  done"
 echo "[5/7] usb-host-mode.service..."
 sudo tee /etc/systemd/system/usb-host-mode.service > /dev/null <<EOF
 [Unit]
-Description=Force USB-C to host mode after Qualcomm ADSP OTG switch
-After=multi-user.target
+Description=Boot USB-C into device mode (user toggles to host via web UI)
+After=sysinit.target
 DefaultDependencies=no
 Conflicts=adbd.service
 
 [Service]
 Type=oneshot
 RemainAfterExit=yes
-ExecStart=/bin/sh -c 'sleep 25 && echo host > $ROLE_SYSFS'
+ExecStart=/bin/sh -c 'sleep 2 && echo device > $ROLE_SYSFS'
 
 [Install]
 WantedBy=multi-user.target
@@ -118,17 +118,11 @@ sudo systemctl stop adbd.service    2>/dev/null || true
 echo "  done"
 
 # ── 7. Deploy haptic server ───────────────────────────────────────────────────
-echo "[7/7] Deploying haptic server + YOLO worker..."
+echo "[7/7] Deploying haptic server + rgb_worker..."
 cp "$ARDUINO_HOME/haptic_depth_server.py" "$ARDUINO_HOME/haptic_depth_server.py.bak" 2>/dev/null || true
-cp "$(dirname "$0")/haptic_depth_server.py" "$ARDUINO_HOME/haptic_depth_server.py" 2>/dev/null \
-    || true
-cp "$(dirname "$0")/yolo_worker.py" "$ARDUINO_HOME/yolo_worker.py" 2>/dev/null || true
-
-# YOLO models
-mkdir -p "$ARDUINO_HOME/models"
-for f in "$(dirname "$0")/models/"*.onnx; do
-    [ -f "$f" ] && cp "$f" "$ARDUINO_HOME/models/" && echo "  copied model: $(basename $f)"
-done
+cp "$(dirname "$0")/haptic_depth_server.py" "$ARDUINO_HOME/haptic_depth_server.py" 2>/dev/null || true
+cp "$(dirname "$0")/rgb_worker.py"          "$ARDUINO_HOME/rgb_worker.py"           2>/dev/null || true
+mkdir -p /dev/shm/tactile
 
 sudo cp "$ARDUINO_HOME/haptic-demo.service" /etc/systemd/system/haptic-demo.service
 sudo systemctl daemon-reload
@@ -153,6 +147,7 @@ echo "=== Done ==="
 echo "Web UI:    http://10.221.208.1:8081"
 echo "Grid JSON: http://10.221.208.1:8081/grid"
 echo "Depth cam: http://10.221.208.1:8081/depth.mjpg  (toggle in UI)"
+echo "Capture WS: ws://10.221.208.1:8083"
 echo ""
 echo "If camera not detected, reboot the board:"
 echo "  sudo reboot"

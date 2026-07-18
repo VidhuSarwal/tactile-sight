@@ -1,7 +1,6 @@
 [Unit]
 Description=TactileSight haptic grid server — depth->haptic at :8081
-After=usb-host-mode.service network.target
-Wants=usb-host-mode.service
+After=network.target
 StartLimitIntervalSec=0
 
 [Service]
