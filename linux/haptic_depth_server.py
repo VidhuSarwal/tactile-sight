@@ -388,30 +388,36 @@ def process_frame(frame_bytes, w, h):
 
 def camera_loop():
     lib_path = os.path.join(NIDIR, "libOpenNI2.so")
+    lib = ctypes.CDLL(lib_path)
+    lib.oniInitialize.restype         = ctypes.c_int
+    lib.oniDeviceOpen.restype         = ctypes.c_int
+    lib.oniDeviceClose.restype        = ctypes.c_int
+    lib.oniDeviceCreateStream.restype = ctypes.c_int
+    lib.oniStreamStart.restype        = ctypes.c_int
+    lib.oniStreamStop.restype         = None
+    lib.oniStreamDestroy.restype      = None
+    lib.oniStreamReadFrame.restype    = ctypes.c_int
+    lib.oniFrameRelease.restype       = None
+    lib.oniShutdown.restype           = None
+
+    # Initialize once — repeated oniInitialize/oniShutdown per retry causes SIGSEGV
+    _status[0] = "initializing OpenNI2..."
+    log(_status[0])
+    if lib.oniInitialize(2) != 0:
+        log("oniInitialize failed — cannot continue")
+        _status[0] = "OpenNI init failed"
+        return
+
+    # Outer loop: retry device open on camera disconnect / hot-plug
     while True:
-        lib = None
+        dev    = ctypes.c_void_p()
+        stream = ctypes.c_void_p()
         try:
-            lib = ctypes.CDLL(lib_path)
-            lib.oniInitialize.restype         = ctypes.c_int
-            lib.oniDeviceOpen.restype         = ctypes.c_int
-            lib.oniDeviceCreateStream.restype = ctypes.c_int
-            lib.oniStreamStart.restype        = ctypes.c_int
-            lib.oniStreamReadFrame.restype    = ctypes.c_int
-            lib.oniFrameRelease.restype       = None
-            lib.oniShutdown.restype           = None
-
-            _status[0] = "initializing OpenNI2..."
-            log(_status[0])
-            if lib.oniInitialize(2) != 0:
-                raise RuntimeError("oniInitialize failed")
-
             _status[0] = "opening depth device..."
             log(_status[0])
-            dev = ctypes.c_void_p()
             if lib.oniDeviceOpen(None, ctypes.byref(dev)) != 0:
-                raise RuntimeError("no camera — retrying...")
+                raise RuntimeError("no camera")
 
-            stream = ctypes.c_void_p()
             if lib.oniDeviceCreateStream(dev, 3, ctypes.byref(stream)) != 0:
                 raise RuntimeError("oniDeviceCreateStream(depth=3) failed")
             if lib.oniStreamStart(stream) != 0:
@@ -428,12 +434,17 @@ def camera_loop():
             log(f"depth->haptic active | {HIST_FRAMES}-frame median"
                 + (" | MJPEG ready" if _MJPEG else ""))
 
+            fail_count = 0
             while True:
                 frame = ctypes.c_void_p()
                 rc = lib.oniStreamReadFrame(stream, ctypes.byref(frame))
                 if rc != 0 or not frame.value:
+                    fail_count += 1
+                    if fail_count > 20:
+                        raise RuntimeError("camera disconnected")
                     time.sleep(0.005)
                     continue
+                fail_count = 0
 
                 # CRITICAL: string_at copies bytes — never use from_address with numpy loaded
                 hdr       = ctypes.string_at(frame.value, 80)
@@ -455,14 +466,22 @@ def camera_loop():
         except Exception as e:
             _status[0] = f"waiting for camera ({e})"
             log(f"camera: {e}")
-            if lib:
-                try: lib.oniShutdown()
+        finally:
+            # Close stream and device — but never oniShutdown (causes SIGSEGV on reinit)
+            if stream.value:
+                try: lib.oniStreamStop(stream)
                 except Exception: pass
-            with _grid_lock:
-                _grid[:]   = [0.0] * N_CELLS
-                _raw_mm[:] = [0]   * N_CELLS
-            log("retry in 5s...")
-            time.sleep(5)
+                try: lib.oniStreamDestroy(stream)
+                except Exception: pass
+            if dev.value:
+                try: lib.oniDeviceClose(dev)
+                except Exception: pass
+
+        with _grid_lock:
+            _grid[:]   = [0.0] * N_CELLS
+            _raw_mm[:] = [0]   * N_CELLS
+        log("retry in 5s...")
+        time.sleep(5)
 
 
 # ── HTML ──────────────────────────────────────────────────────────────────────
