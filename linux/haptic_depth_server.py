@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """
-TactileSight depth->haptic server  v5
+TactileSight depth->haptic server  v6
   GET /           -> haptic grid web UI (USB toggle + depth cam + capture button)
   GET /grid       -> JSON {grid, raw_mm, status, usb_mode}
   GET /depth.mjpg -> colorized depth MJPEG stream (needs pillow)
   POST /toggle    -> flip USB-C host<->device (power-cycles camera when going to host)
   POST /capture   -> one-shot: grab rgb.jpg + depth.png + meta.json, push via WebSocket
   WS  :8083       -> JSON bundle {ts, rgb_b64, depth_b64} sent once per /capture call
+  UART HAPTIC_TTY -> 24-byte binary frames at ~30fps → internal STM32 for haptic motors
   Port 8081 (HTTP) + 8083 (WebSocket)
 
 Sensing: 21 cells (3 rows x 7 cols), each like an independent ultrasonic sensor.
@@ -35,6 +36,7 @@ try:
 except ImportError:
     _WS = False
 
+
 NIDIR = os.path.expanduser(
     "~/OpenNI_SDK/OpenNI_2.3.0.86_202210111155_4c8f5aa4_beta6_a311d/tools/NiViewer")
 os.chdir(NIDIR)
@@ -42,7 +44,8 @@ os.environ.setdefault("LD_LIBRARY_PATH", NIDIR)
 
 ROLE_PATH = ("/sys/devices/platform/soc@0/4ef8800.usb/4e00000.usb"
              "/usb_role/4e00000.usb-role-switch/role")
-SHM_DIR   = "/dev/shm/tactile"
+SHM_DIR          = "/dev/shm/tactile"
+_HAPTIC_GRID_SHM = "/dev/shm/tactile/haptic_grid.bin"
 COLS, ROWS = 7, 3
 N_CELLS    = COLS * ROWS
 
@@ -232,6 +235,14 @@ def camera_loop():
                     with _grid_lock:
                         _grid[:]   = levels
                         _raw_mm[:] = raw_mm
+                    # v6: write grid to shm for uart_sender subprocess
+                    try:
+                        grid_bytes = bytes([max(0, min(255, int(v))) for v in levels])
+                        with open(_HAPTIC_GRID_SHM + '.tmp', 'wb') as f:
+                            f.write(grid_bytes)
+                        os.rename(_HAPTIC_GRID_SHM + '.tmp', _HAPTIC_GRID_SHM)
+                    except Exception:
+                        pass
                     # v5: snapshot hook — zero OpenNI2 calls, safe
                     with _snap_lock:
                         if _snap_requested:
@@ -291,6 +302,27 @@ async def _ws_main():
     log("ws capture server on :8083")
     async with _wslib.serve(_ws_handler, "0.0.0.0", 8083):
         await asyncio.Future()   # run forever
+
+
+def uart_sender_watchdog():
+    """Launch uart_sender.py as a subprocess; restart it if it crashes."""
+    sender_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                               "uart_sender.py")
+    if not os.path.exists(sender_path):
+        log("uart: uart_sender.py not found — haptic UART disabled")
+        return
+    while True:
+        try:
+            proc = subprocess.Popen(["python3", sender_path],
+                                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+            log(f"uart: sender started (pid {proc.pid})")
+            for line in proc.stdout:
+                log("uart-sub: " + line.decode(errors='replace').rstrip())
+            proc.wait()
+            log(f"uart: sender exited (rc={proc.returncode}) — restarting in 5s")
+        except Exception as e:
+            log(f"uart: watchdog error: {e}")
+        time.sleep(5)
 
 
 def ws_server_loop():
@@ -735,8 +767,9 @@ if __name__ == "__main__":
 
     threading.Thread(target=camera_loop,    daemon=True).start()
     threading.Thread(target=ws_server_loop, daemon=True).start()
+    threading.Thread(target=uart_sender_watchdog, daemon=True).start()
 
-    log(f"TactileSight v5 | http://10.221.208.1:8081 | ws://10.221.208.1:8083"
+    log(f"TactileSight v6 | http://10.221.208.1:8081 | ws://10.221.208.1:8083"
         f" | detect 0-{DETECT_MM}mm | median/{HIST_FRAMES}f")
     srv = ThreadedHTTPServer(("0.0.0.0", 8081), Handler)
     srv.serve_forever()

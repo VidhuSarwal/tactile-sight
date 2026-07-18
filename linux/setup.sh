@@ -34,7 +34,7 @@ echo "[1/7] Installing system deps..."
 sudo apt-get update -qq
 sudo apt-get install -y unrar python3-pip python3-opencv python3-numpy
 pip3 install --quiet pillow
-pip3 install --break-system-packages --quiet websockets pypng
+pip3 install --break-system-packages --quiet websockets pypng pyserial
 
 # ── 2. OpenNI SDK ─────────────────────────────────────────────────────────────
 echo "[2/7] OpenNI SDK..."
