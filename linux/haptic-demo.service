@@ -1,0 +1,18 @@
+[Unit]
+Description=TactileSight haptic grid server — depth->haptic at :8081
+After=usb-host-mode.service network.target
+Wants=usb-host-mode.service
+
+[Service]
+Type=simple
+User=arduino
+WorkingDirectory=/home/arduino/OpenNI_SDK/OpenNI_2.3.0.86_202210111155_4c8f5aa4_beta6_a311d/tools/NiViewer
+Environment=LD_LIBRARY_PATH=/home/arduino/OpenNI_SDK/OpenNI_2.3.0.86_202210111155_4c8f5aa4_beta6_a311d/tools/NiViewer
+ExecStart=python3 /home/arduino/haptic_depth_server.py
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
