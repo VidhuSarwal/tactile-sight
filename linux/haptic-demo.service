@@ -10,6 +10,9 @@ WorkingDirectory=/home/arduino/OpenNI_SDK/OpenNI_2.3.0.86_202210111155_4c8f5aa4_
 Environment=LD_LIBRARY_PATH=/home/arduino/OpenNI_SDK/OpenNI_2.3.0.86_202210111155_4c8f5aa4_beta6_a311d/tools/NiViewer
 Environment=HAPTIC_TTY=/dev/ttyHS1
 Environment=HAPTIC_BAUD=115200
+Environment=MALLOC_ARENA_MAX=2
+Environment=MALLOC_MMAP_THRESHOLD_=131072
+Environment=MALLOC_TRIM_THRESHOLD_=131072
 ExecStart=python3 /home/arduino/haptic_depth_server.py
 Restart=always
 RestartSec=5

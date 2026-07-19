@@ -18,7 +18,7 @@ Sensing: 21 cells (3 rows x 7 cols), each like an independent ultrasonic sensor.
 CRITICAL: Never import cv2 in this process — causes SIGSEGV with OpenNI2 ctypes.
           cv2 lives exclusively in rgb_worker.py (subprocess).
 """
-import os, ctypes, threading, struct, time, json, subprocess, asyncio, base64
+import os, ctypes, threading, struct, time, json, subprocess, asyncio, base64, queue, gc
 import numpy as np
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from socketserver import ThreadingMixIn
@@ -63,20 +63,27 @@ _status    = ["starting..."]
 _hist      = [[float(DETECT_MM)] * HIST_FRAMES for _ in range(N_CELLS)]
 _hist_i    = 0
 
+# ── frame pipeline: raw frames flow camera_loop → _raw_frame_q → frame_processor
+# maxsize=2: camera_loop drops frames if processor is behind; OpenNI2 queue stays drained
+_raw_frame_q = queue.Queue(maxsize=2)
+
 # ── MJPEG stream ───────────────────────────────────────────────────────────────
-# camera_loop writes raw uint16 bytes here; _stream_mjpeg() encodes JPEG itself
-# so PIL never runs on the camera thread (GIL kept free for HTTP handlers)
-_jpg_lock         = threading.Lock()
-_depth_raw_mjpeg  = None   # latest raw depth bytes for MJPEG encoding
-_mjpeg_cli_lock   = threading.Lock()
-_mjpeg_clients    = 0
+# frame_processor shares raw bytes here; _stream_mjpeg() encodes JPEG in its own thread
+_jpg_lock          = threading.Lock()
+_depth_raw_mjpeg   = None   # latest raw depth bytes
+_depth_frame_count = 0       # monotonic counter; MJPEG uses this to detect new frames
+_mjpeg_cli_lock    = threading.Lock()
+_mjpeg_clients     = 0
 
 # ── snapshot / capture state ───────────────────────────────────────────────────
 _snap_lock      = threading.Lock()
-_snap_requested = False       # HTTP /capture handler sets; camera_loop clears
+_snap_requested = False
 _snap_ready_evt = threading.Event()
-_snap_depth_raw = None        # bytes 640×480×2, set by camera_loop
+_snap_depth_raw = None        # bytes 640×480×2, set by frame_processor
 _snap_ts        = 0.0
+
+# ── capture queue — maxsize=1 so the latest press wins; processed by capture_worker
+_capture_queue = queue.Queue(maxsize=1)
 
 # ── WebSocket server state ─────────────────────────────────────────────────────
 _ws_loop         = None       # asyncio event loop running in ws_server_loop thread
@@ -88,10 +95,11 @@ log = lambda m: print(f"[srv] {m}", flush=True)
 try:
     import io as _png_io, png as _png_lib
     def encode_depth_png(raw_bytes):
+        # Build rows as memoryviews to avoid arr.tolist() (GIL-heavy pure Python)
         arr = np.frombuffer(raw_bytes, dtype=np.uint16).reshape(480, 640)
         buf = _png_io.BytesIO()
         _png_lib.Writer(width=640, height=480, bitdepth=16, greyscale=True).write(
-            buf, arr.tolist())
+            buf, (arr[r] for r in range(arr.shape[0])))
         return buf.getvalue()
     _HAVE_PNG = True
 except ImportError:
@@ -121,7 +129,7 @@ def colorize_depth(d_u16):
 
 
 def process_frame(frame_bytes, w, h):
-    global _hist_i, _depth_raw_mjpeg
+    global _hist_i, _depth_raw_mjpeg, _depth_frame_count
     d = np.frombuffer(frame_bytes, dtype=np.uint16).reshape(h, w)
     ch, cw = h // ROWS, w // COLS
 
@@ -151,13 +159,17 @@ def process_frame(frame_bytes, w, h):
         has_clients = _mjpeg_clients > 0
     if _MJPEG and has_clients:
         with _jpg_lock:
-            _depth_raw_mjpeg = frame_bytes   # already a bytes copy from ctypes.string_at
+            _depth_raw_mjpeg   = frame_bytes   # already a bytes copy from ctypes.string_at
+            _depth_frame_count += 1
 
     return levels, raw_out
 
 
 def camera_loop():
-    global _snap_requested, _snap_depth_raw, _snap_ts
+    """Reads raw depth frames from OpenNI2 as fast as possible and enqueues them.
+    No numpy or PIL work happens here — that lives in frame_processor().
+    Keeping this loop tight prevents OpenNI2's internal C++ frame queue from filling up,
+    which was causing SIGSEGV from malloc failure in C++ code."""
     lib_path = os.path.join(NIDIR, "libOpenNI2.so")
     lib = ctypes.CDLL(lib_path)
     lib.oniInitialize.restype         = ctypes.c_int
@@ -204,17 +216,23 @@ def camera_loop():
 
             streams_arr = (ctypes.c_void_p * 1)(stream.value)
             stream_idx  = ctypes.c_int(-1)
+            timeout_streak = 0
 
             while True:
                 rc_wait = lib.oniWaitForAnyStream(streams_arr, 1,
                                                   ctypes.byref(stream_idx), 500)
                 if rc_wait != 0:
-                    raise RuntimeError(f"stream lost (rc={rc_wait}) — USB disconnected?")
+                    if rc_wait == 102:   # ONI_STATUS_TIME_OUT — transient, not fatal
+                        timeout_streak += 1
+                        if timeout_streak < 10:
+                            continue
+                        raise RuntimeError(f"stream timed out 10×  — USB disconnected?")
+                    raise RuntimeError(f"stream lost (rc={rc_wait})")
+                timeout_streak = 0
 
                 frame = ctypes.c_void_p()
                 rc = lib.oniStreamReadFrame(stream, ctypes.byref(frame))
                 if rc != 0 or not frame.value:
-                    time.sleep(0.005)
                     continue
 
                 # CRITICAL: string_at copies bytes — never use from_address with numpy loaded
@@ -227,25 +245,13 @@ def camera_loop():
                 if data_addr and data_size > 0 and w > 0 and h > 0:
                     raw = ctypes.string_at(data_addr, data_size)
                     lib.oniFrameRelease(ctypes.byref(frame))
-                    levels, raw_mm = process_frame(raw, w, h)
-                    with _grid_lock:
-                        _grid[:]   = levels
-                        _raw_mm[:] = raw_mm
-                    # v6: write grid to shm for uart_sender subprocess
+                    # Enqueue for processing; drop frame if processor is behind
+                    # (prevents OpenNI2 C++ queue from filling → SIGSEGV)
                     try:
-                        grid_bytes = bytes([max(0, min(255, int(v))) for v in levels])
-                        with open(_HAPTIC_GRID_SHM + '.tmp', 'wb') as f:
-                            f.write(grid_bytes)
-                        os.rename(_HAPTIC_GRID_SHM + '.tmp', _HAPTIC_GRID_SHM)
-                    except Exception:
+                        _raw_frame_q.put_nowait((raw, w, h))
+                    except queue.Full:
                         pass
-                    # v5: snapshot hook — zero OpenNI2 calls, safe
-                    with _snap_lock:
-                        if _snap_requested:
-                            _snap_depth_raw = raw
-                            _snap_ts        = time.time()
-                            _snap_requested = False
-                            _snap_ready_evt.set()
+                    del raw  # release local ref immediately
                 else:
                     lib.oniFrameRelease(ctypes.byref(frame))
 
@@ -266,6 +272,47 @@ def camera_loop():
                 _raw_mm[:] = [0]   * N_CELLS
         log("retry in 5s...")
         time.sleep(5)
+
+
+def frame_processor():
+    """Dequeues raw frames from _raw_frame_q and does all numpy/haptic/shm work.
+    Runs in a separate thread so camera_loop stays free to drain OpenNI2."""
+    global _snap_requested, _snap_depth_raw, _snap_ts
+    frame_count = 0
+    while True:
+        try:
+            raw, w, h = _raw_frame_q.get(timeout=2)
+        except queue.Empty:
+            continue
+
+        levels, raw_mm = process_frame(raw, w, h)
+
+        with _grid_lock:
+            _grid[:]   = levels
+            _raw_mm[:] = raw_mm
+
+        # Write grid to shm for uart_sender subprocess
+        try:
+            grid_bytes = bytes([max(0, min(255, int(v))) for v in levels])
+            with open(_HAPTIC_GRID_SHM + '.tmp', 'wb') as f:
+                f.write(grid_bytes)
+            os.rename(_HAPTIC_GRID_SHM + '.tmp', _HAPTIC_GRID_SHM)
+        except Exception:
+            pass
+
+        # Snapshot hook for capture
+        with _snap_lock:
+            if _snap_requested:
+                _snap_depth_raw = raw
+                _snap_ts        = time.time()
+                _snap_requested = False
+                _snap_ready_evt.set()
+
+        del raw   # release frame bytes; GC can reclaim immediately
+
+        frame_count += 1
+        if frame_count % 500 == 0:
+            gc.collect()
 
 
 # ── WebSocket server ───────────────────────────────────────────────────────────
@@ -328,57 +375,81 @@ def ws_server_loop():
     asyncio.run(_ws_main())
 
 
-def _do_capture():
-    """One-shot: grab depth + rgb, encode, broadcast. Called from HTTP handler thread."""
+def capture_worker():
+    """Processes capture requests from _capture_queue one at a time.
+    Runs in its own daemon thread so HTTP /capture returns immediately."""
     global _snap_requested
-    if not _ws_loop:
-        return {"ok": False, "error": "ws server not ready"}
+    while True:
+        ts_trigger = _capture_queue.get()   # blocks until a request arrives
 
-    # 1. Trigger rgb_worker
-    ts_now = time.time()
-    try:
-        with open(os.path.join(SHM_DIR, 'trigger.ts'), 'w') as f:
-            f.write(str(ts_now))
-    except Exception:
-        pass
+        if not _ws_loop:
+            log("capture: ws server not ready — skipping")
+            if _ws_loop:
+                asyncio.run_coroutine_threadsafe(
+                    _broadcast(json.dumps({"error": "ws server not ready"})), _ws_loop)
+            continue
 
-    # 2. Request depth frame from camera_loop
-    _snap_ready_evt.clear()
-    with _snap_lock:
-        _snap_requested = True
-    got = _snap_ready_evt.wait(timeout=3)
+        if _status[0] != "streaming":
+            log(f"capture: camera not ready ({_status[0]}) — skipping")
+            asyncio.run_coroutine_threadsafe(
+                _broadcast(json.dumps({"error": f"camera not ready: {_status[0]}"})),
+                _ws_loop)
+            continue
 
-    if not got:
-        log("capture: timeout — camera not streaming?")
-        return {"ok": False, "error": "camera not streaming"}
+        # 1. Trigger rgb_worker
+        try:
+            with open(os.path.join(SHM_DIR, 'trigger.ts'), 'w') as f:
+                f.write(str(ts_trigger))
+        except Exception as e:
+            log(f"capture: trigger write failed: {e}")
 
-    with _snap_lock:
-        d_raw = _snap_depth_raw
-        ts    = _snap_ts
+        # 2. Request depth frame from frame_processor
+        _snap_ready_evt.clear()
+        with _snap_lock:
+            _snap_requested = True
+        got = _snap_ready_evt.wait(timeout=3.0)
 
-    # 3. Wait briefly for rgb_worker to flush its file
-    time.sleep(0.15)
-    try:
-        rgb_jpg = open(os.path.join(SHM_DIR, 'rgb.jpg'), 'rb').read()
-    except Exception:
-        rgb_jpg = b''
+        if not got:
+            log("capture: depth frame timeout — camera not streaming?")
+            asyncio.run_coroutine_threadsafe(
+                _broadcast(json.dumps({"error": "depth timeout"})), _ws_loop)
+            continue
 
-    # 4. Encode and broadcast
-    try:
-        depth_png = encode_depth_png(d_raw)
-    except Exception as e:
-        log(f"capture: encode error: {e}")
-        depth_png = b''
+        with _snap_lock:
+            d_raw = _snap_depth_raw
+            ts    = _snap_ts
 
-    bundle = json.dumps({
-        "ts":        ts,
-        "rgb_b64":   base64.b64encode(rgb_jpg).decode(),
-        "depth_b64": base64.b64encode(depth_png).decode(),
-    })
-    asyncio.run_coroutine_threadsafe(_broadcast(bundle), _ws_loop)
-    log(f"capture: sent {len(rgb_jpg)//1024}KB rgb + {len(depth_png)//1024}KB depth "
-        f"to {len(_ws_clients)} client(s)")
-    return {"ok": True}
+        # 3. Poll for rgb.jpg newer than the trigger timestamp (up to 1s)
+        rgb_jpg  = b''
+        rgb_path = os.path.join(SHM_DIR, 'rgb.jpg')
+        deadline = time.time() + 1.0
+        while time.time() < deadline:
+            try:
+                mtime = os.path.getmtime(rgb_path)
+                if mtime >= ts_trigger:
+                    rgb_jpg = open(rgb_path, 'rb').read()
+                    break
+            except Exception:
+                pass
+            time.sleep(0.05)
+        if not rgb_jpg:
+            log("capture: rgb.jpg not ready in 1s — sending depth only")
+
+        # 4. Encode depth PNG and broadcast
+        try:
+            depth_png = encode_depth_png(d_raw)
+        except Exception as e:
+            log(f"capture: encode error: {e}")
+            depth_png = b''
+
+        bundle = json.dumps({
+            "ts":        ts,
+            "rgb_b64":   base64.b64encode(rgb_jpg).decode(),
+            "depth_b64": base64.b64encode(depth_png).decode(),
+        })
+        asyncio.run_coroutine_threadsafe(_broadcast(bundle), _ws_loop)
+        log(f"capture: sent {len(rgb_jpg)//1024}KB rgb + {len(depth_png)//1024}KB depth "
+            f"to {len(_ws_clients)} client(s)")
 
 
 # ── HTML ───────────────────────────────────────────────────────────────────────
@@ -598,6 +669,12 @@ function connectWS() {
   ws.onmessage = function(e) {
     let d;
     try { d = JSON.parse(e.data); } catch { return; }
+    if (d.error) {
+      capBtn.disabled = false;
+      capBtn.textContent = '[ capture ]';
+      snapTs.textContent = 'failed: ' + d.error;
+      return;
+    }
     if (d.rgb_b64) {
       const rgbSrc = 'data:image/jpeg;base64,' + d.rgb_b64;
       rgbPreview.src = rgbSrc;
@@ -690,18 +767,22 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         with _mjpeg_cli_lock:
             _mjpeg_clients += 1
-        last_raw = None
+        last_count = -1
         try:
             while True:
                 with _jpg_lock:
-                    raw = _depth_raw_mjpeg
-                if raw and raw is not last_raw:
-                    last_raw = raw
+                    raw   = _depth_raw_mjpeg
+                    count = _depth_frame_count
+                if raw and count != last_count:
+                    last_count = count
+                    # .copy() makes an independent numpy array so 'raw' bytes can be
+                    # freed immediately — breaks the np.frombuffer base-chain reference
+                    arr = np.frombuffer(raw, dtype=np.uint16).reshape(480, 640).copy()
+                    raw = None   # release bytes reference NOW; frame_processor owns it
                     jpg = None
                     try:
-                        d   = np.frombuffer(raw, dtype=np.uint16).reshape(480, 640)
-                        rgb = colorize_depth(d)
-                        del d
+                        rgb = colorize_depth(arr)
+                        del arr
                         img = Image.fromarray(rgb, 'RGB')
                         del rgb
                         buf = _io.BytesIO()
@@ -750,8 +831,12 @@ class Handler(BaseHTTPRequestHandler):
                 json.dumps({"usb_mode": get_usb_mode()}))
 
         elif self.path == '/capture':
-            result = _do_capture()
-            self._send(200, "application/json", json.dumps(result))
+            try:
+                _capture_queue.put_nowait(time.time())
+                self._send(200, "application/json", json.dumps({"ok": True}))
+            except queue.Full:
+                self._send(200, "application/json",
+                    json.dumps({"ok": False, "error": "capture in progress"}))
 
         else:
             self._send(404, "text/plain", "not found")
@@ -781,8 +866,10 @@ if __name__ == "__main__":
     else:
         log(f"WARNING: rgb_worker.py not found — RGB capture disabled")
 
-    threading.Thread(target=camera_loop,    daemon=True).start()
-    threading.Thread(target=ws_server_loop, daemon=True).start()
+    threading.Thread(target=camera_loop,         daemon=True).start()
+    threading.Thread(target=frame_processor,     daemon=True).start()
+    threading.Thread(target=ws_server_loop,      daemon=True).start()
+    threading.Thread(target=capture_worker,      daemon=True).start()
     threading.Thread(target=uart_sender_watchdog, daemon=True).start()
 
     log(f"TactileSight v6 | http://10.221.208.1:8081 | ws://10.221.208.1:8083"
