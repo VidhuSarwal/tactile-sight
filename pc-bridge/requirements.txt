@@ -1,0 +1,3 @@
+# Only one dependency: everything else is Python stdlib on purpose, so this
+# runs on a laptop that has never seen this project before.
+pyserial>=3.5

@@ -1,0 +1,23 @@
+# Keeps the band fed. Install with ./install-service.sh
+#
+# Restart=always, not on-failure: a clean exit is still an outage as far as the
+# wearer is concerned, and there is no exit code that means "stop feeding the
+# band on purpose". Stopping is what `systemctl --user stop` is for.
+[Unit]
+Description=TactileSight band bridge (depth server -> USB serial)
+After=network-online.target
+
+[Service]
+# Without this Python buffers stdout when it is not a TTY, so the journal stays
+# empty and the one place you would look to see the band working shows nothing.
+Environment=PYTHONUNBUFFERED=1
+Type=simple
+WorkingDirectory=%h/Projects/tactile-sight/pc-bridge
+ExecStart=%h/Projects/tactile-sight/pc-bridge/.venv/bin/python %h/Projects/tactile-sight/pc-bridge/haptic_serial_bridge.py
+Restart=always
+RestartSec=3
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target
