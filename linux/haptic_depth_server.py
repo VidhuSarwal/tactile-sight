@@ -121,7 +121,7 @@ def colorize_depth(d_u16):
 
 
 def process_frame(frame_bytes, w, h):
-    global _hist_i
+    global _hist_i, _depth_raw_mjpeg
     d = np.frombuffer(frame_bytes, dtype=np.uint16).reshape(h, w)
     ch, cw = h // ROWS, w // COLS
 
@@ -697,23 +697,31 @@ class Handler(BaseHTTPRequestHandler):
                     raw = _depth_raw_mjpeg
                 if raw and raw is not last_raw:
                     last_raw = raw
+                    jpg = None
                     try:
                         d   = np.frombuffer(raw, dtype=np.uint16).reshape(480, 640)
                         rgb = colorize_depth(d)
+                        del d
                         img = Image.fromarray(rgb, 'RGB')
+                        del rgb
                         buf = _io.BytesIO()
                         img.save(buf, format='JPEG', quality=55)
+                        del img
                         jpg = buf.getvalue()
-                        part = (
-                            b"--frame\r\n"
-                            b"Content-Type: image/jpeg\r\n"
-                            b"Content-Length: " + str(len(jpg)).encode() + b"\r\n"
-                            b"\r\n" + jpg + b"\r\n"
-                        )
-                        self.wfile.write(part)
-                        self.wfile.flush()
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        log(f"mjpeg encode error: {e}")
+                    if jpg:
+                        try:
+                            part = (
+                                b"--frame\r\n"
+                                b"Content-Type: image/jpeg\r\n"
+                                b"Content-Length: " + str(len(jpg)).encode() + b"\r\n"
+                                b"\r\n" + jpg + b"\r\n"
+                            )
+                            self.wfile.write(part)
+                            self.wfile.flush()
+                        except Exception:
+                            break   # connection closed — exit handler, free memory
                 time.sleep(0.1)   # encode at most 10fps, camera runs at 30fps
         except Exception:
             pass
