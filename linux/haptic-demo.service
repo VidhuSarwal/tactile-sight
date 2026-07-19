@@ -8,8 +8,10 @@ Type=simple
 User=arduino
 WorkingDirectory=/home/arduino/OpenNI_SDK/OpenNI_2.3.0.86_202210111155_4c8f5aa4_beta6_a311d/tools/NiViewer
 Environment=LD_LIBRARY_PATH=/home/arduino/OpenNI_SDK/OpenNI_2.3.0.86_202210111155_4c8f5aa4_beta6_a311d/tools/NiViewer
-Environment=HAPTIC_TTY=/dev/ttyHS1
-Environment=HAPTIC_BAUD=115200
+# Haptic output to the STM32 goes over the Arduino Router Bridge (bridge_sender.py).
+# Do NOT set HAPTIC_TTY=/dev/ttyHS1 — that port belongs to the arduino-router
+# daemon and opening it breaks the bridge until reboot (stm.md).
+Environment=HAPTIC_SENDER=bridge_sender.py
 Environment=MALLOC_ARENA_MAX=2
 Environment=MALLOC_MMAP_THRESHOLD_=131072
 Environment=MALLOC_TRIM_THRESHOLD_=131072

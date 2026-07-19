@@ -267,14 +267,26 @@ Flyback diode across motor terminals (cathode to +)
 | Item | Status |
 |------|--------|
 | Bridge socket (`/var/run/arduino-router.sock`) | **Live and confirmed** on board |
-| Python `arduino.app_utils` library | Needs verification — install via App Lab SDK |
-| `uart_sender.py` (raw serial approach) | **Not working** — all TTYs reserved or I/O error |
+| Python `arduino.app_utils` library | **Not installed** — and no longer needed, see below |
+| `msgpack` (pip) | **Installed** on board |
+| MsgPack-RPC over the bridge socket from Python | **Confirmed working** — 10 sequential calls in 0.01s on one persistent connection |
+| `linux/bridge_sender.py` | **Deployed and running** as the server's haptic subprocess |
+| STM32 sketch registering `set_haptic_grid` | **NOT UPLOADED** — the one remaining gap |
+| `uart_sender.py` (raw serial approach) | **Retired** — now opt-in via `HAPTIC_TTY`, refuses `/dev/ttyHS1` |
 | `/dev/ttyHS1` direct access | **Blocked** — reserved by `arduino-router` daemon |
-| Bridge.call() from Python | **Documented path**, not yet tested with haptic sketch |
 
-The current `uart_sender.py` subprocess will always fail because no usable raw serial port
-exists. Once the Bridge sketch is uploaded and `arduino.app_utils` is confirmed installed,
-replace `uart_sender.py` with the Bridge-based sender shown above.
+`arduino.app_utils` is not present on the board, so `bridge_sender.py` speaks MsgPack-RPC to
+the socket directly (the "direct MsgPack socket" path above) and has no dependency on it.
+
+The transport is proven end to end. The bridge currently answers every call with
+`[2, 'method set_haptic_grid not available']`, which is exactly what it should say until the
+sketch is uploaded. Upload `linux/haptic_bridge_receiver.ino` and haptics go live with no
+Linux-side change — `bridge_sender.py` detects it automatically and logs
+`'set_haptic_grid' is now available — haptics live`.
+
+**Server IP is DHCP-assigned and has changed** (the `10.221.208.1` used throughout these docs
+is stale). The server no longer hardcodes it: it detects and logs its real address at startup.
+Read it with `journalctl -u haptic-demo | grep "LAN debug UI"`, or `ip -4 addr show wlan0`.
 
 ---
 

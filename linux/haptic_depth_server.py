@@ -18,7 +18,7 @@ Sensing: 21 cells (3 rows x 7 cols), each like an independent ultrasonic sensor.
 CRITICAL: Never import cv2 in this process — causes SIGSEGV with OpenNI2 ctypes.
           cv2 lives exclusively in rgb_worker.py (subprocess).
 """
-import os, ctypes, threading, struct, time, json, subprocess, asyncio, base64, queue, gc
+import os, ctypes, threading, struct, time, json, subprocess, asyncio, base64, queue, gc, socket
 import numpy as np
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from socketserver import ThreadingMixIn
@@ -182,6 +182,7 @@ def camera_loop():
     lib.oniStreamReadFrame.restype    = ctypes.c_int
     lib.oniWaitForAnyStream.restype   = ctypes.c_int
     lib.oniFrameRelease.restype       = None
+    lib.oniFrameRelease.argtypes      = [ctypes.c_void_p]  # OniFrame*, NOT OniFrame**
 
     # Allow camera USB to settle after a process restart (prevents SIGSEGV during
     # oniInitialize when the USB device is still resetting from a prior crash)
@@ -210,7 +211,7 @@ def camera_loop():
                 frame = ctypes.c_void_p()
                 lib.oniStreamReadFrame(stream, ctypes.byref(frame))
                 if frame.value:
-                    lib.oniFrameRelease(ctypes.byref(frame))
+                    lib.oniFrameRelease(frame)
 
             _status[0] = "streaming"
             log(f"depth->haptic active | range 0-{DETECT_MM}mm | {HIST_FRAMES}-frame median"
@@ -249,7 +250,7 @@ def camera_loop():
                 if (data_addr and 0 < data_size <= MAX_FRAME
                         and 0 < w <= 640 and 0 < h <= 480):
                     raw = ctypes.string_at(data_addr, data_size)
-                    lib.oniFrameRelease(ctypes.byref(frame))
+                    lib.oniFrameRelease(frame)
                     # Enqueue for processing; drop frame if processor is behind
                     # (prevents OpenNI2 C++ queue from filling → SIGSEGV)
                     try:
@@ -258,7 +259,7 @@ def camera_loop():
                         pass
                     del raw  # release local ref immediately
                 else:
-                    lib.oniFrameRelease(ctypes.byref(frame))
+                    lib.oniFrameRelease(frame)
 
         except Exception as e:
             _status[0] = f"waiting for camera ({e})"
@@ -413,23 +414,29 @@ def camera_subprocess_watchdog():
 
 
 def uart_sender_watchdog():
-    """Launch uart_sender.py as a subprocess; restart it if it crashes."""
-    sender_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                               "uart_sender.py")
+    """Launch the haptic sender as a subprocess; restart it if it crashes.
+
+    Defaults to bridge_sender.py (Arduino Router Bridge RPC -> STM32), which is
+    the only supported Linux->MCU path on the UNO Q. uart_sender.py is kept only
+    for a genuinely exposed external UART; select it with HAPTIC_SENDER.
+    See stm.md.
+    """
+    sender = os.environ.get("HAPTIC_SENDER", "bridge_sender.py")
+    sender_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), sender)
     if not os.path.exists(sender_path):
-        log("uart: uart_sender.py not found — haptic UART disabled")
+        log(f"haptic: {sender} not found — haptic output disabled")
         return
     while True:
         try:
             proc = subprocess.Popen(["python3", sender_path],
                                     stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-            log(f"uart: sender started (pid {proc.pid})")
+            log(f"haptic: {sender} started (pid {proc.pid})")
             for line in proc.stdout:
-                log("uart-sub: " + line.decode(errors='replace').rstrip())
+                log("haptic-sub: " + line.decode(errors='replace').rstrip())
             proc.wait()
-            log(f"uart: sender exited (rc={proc.returncode}) — restarting in 5s")
+            log(f"haptic: {sender} exited (rc={proc.returncode}) — restarting in 5s")
         except Exception as e:
-            log(f"uart: watchdog error: {e}")
+            log(f"haptic: watchdog error: {e}")
         time.sleep(5)
 
 
@@ -907,6 +914,22 @@ class Handler(BaseHTTPRequestHandler):
             self._send(404, "text/plain", "not found")
 
 
+def _lan_ip():
+    """Best-effort LAN IP of this board. Uses a connectionless UDP socket, so it
+    needs no route to actually exist and never blocks. Falls back to hostname."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(("8.8.8.8", 80))          # no packets sent; just picks the route
+        return s.getsockname()[0]
+    except Exception:
+        try:
+            return socket.gethostbyname(socket.gethostname())
+        except Exception:
+            return "0.0.0.0"
+    finally:
+        s.close()
+
+
 class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
     daemon_threads = True
 
@@ -937,7 +960,12 @@ if __name__ == "__main__":
     threading.Thread(target=capture_worker,      daemon=True).start()
     threading.Thread(target=uart_sender_watchdog, daemon=True).start()
 
-    log(f"TactileSight v6 | http://10.221.208.1:8081 | ws://10.221.208.1:8083"
+    # Report the address we are actually reachable on. The board's IP is DHCP
+    # assigned and has changed before, so never hardcode it — clients (the
+    # Android app) need the real one, and the banner is where people look.
+    ip = _lan_ip()
+    log(f"TactileSight v6 | http://{ip}:8081 | ws://{ip}:8083"
         f" | detect 0-{DETECT_MM}mm | median/{HIST_FRAMES}f")
+    log(f"LAN debug UI: http://{ip}:8081   grid JSON: http://{ip}:8081/grid")
     srv = ThreadedHTTPServer(("0.0.0.0", 8081), Handler)
     srv.serve_forever()

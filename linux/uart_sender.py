@@ -10,10 +10,27 @@ Protocol:   0x55 0xAA [21 cells uint8] [XOR checksum]  → HAPTIC_TTY @ HAPTIC_B
 import os, time, sys
 
 GRID_FILE = "/dev/shm/tactile/haptic_grid.bin"
-TTY       = os.environ.get("HAPTIC_TTY",  "/dev/ttyHS1")
+TTY       = os.environ.get("HAPTIC_TTY", "")
 BAUD      = int(os.environ.get("HAPTIC_BAUD", "115200"))
 
-CANDIDATE_TTYS = [TTY, "/dev/ttyS0", "/dev/ttyS1", "/dev/ttyS2", "/dev/ttyS3"]
+# DO NOT add /dev/ttyHS1 here. It is owned by the arduino-router daemon; opening
+# it desyncs the Linux<->STM32 bridge and needs a board reboot to recover (stm.md).
+# ttyS0-ttyS3 are not wired to the MCU on the UNO Q and only return I/O errors.
+# This sender is therefore OPT-IN: it does nothing unless HAPTIC_TTY names a real
+# external UART. The supported MCU path is bridge_sender.py.
+RESERVED_TTYS = {"/dev/ttyHS1"}
+
+if not TTY:
+    print("[uart] no HAPTIC_TTY set — nothing to do. The supported STM32 path is "
+          "bridge_sender.py (Arduino Router Bridge). See stm.md.", flush=True)
+    raise SystemExit(0)
+
+if TTY in RESERVED_TTYS:
+    print(f"[uart] refusing to open {TTY}: reserved by arduino-router; opening it "
+          f"breaks the bridge until reboot (stm.md). Use bridge_sender.py.", flush=True)
+    raise SystemExit(1)
+
+CANDIDATE_TTYS = [TTY]
 
 def log(msg):
     print(f"[uart] {msg}", flush=True)
