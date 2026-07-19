@@ -1,118 +1,116 @@
-# TactileSight Band — Increment 0
+# TactileSight
 
-Depth-to-haptic pipeline. Runs fully without hardware (simulated camera, terminal display). Real Orbbec Astra Pro Plus slots in later with no code changes.
-
----
-
-## Quick start — Windows (no camera needed)
-
-**Requirements:** Python 3.10+ — https://www.python.org/downloads/
-(the `python` command doesn't need to be in PATH — the bat files find it automatically)
-
-```
-1. Download the release ZIP from the Releases page and extract it anywhere.
-2. Double-click  setup.bat  — installs numpy, pyyaml, pyorbbecsdk2 via pip
-3. Open a terminal in the folder and run a scene:
-```
-
-```bat
-run.bat --scene wall_approach
-run.bat --scene doorway_left
-run.bat --scene person_crossing
-run.bat --scene all_clear
-```
-
-Press `Ctrl-C` to stop. No camera, no drivers, nothing else needed.
+Depth-to-haptic feedback system for the visually impaired. An Orbbec Astra Pro depth camera on the Arduino UNO Q (Qualcomm QRB2210 / arm64 Linux) converts proximity into haptic vibration patterns, sent over UART to an internal STM32 which drives motors on a vest.
 
 ---
 
-## Scenes
+## Hardware
 
-| Scene | What you see |
-|---|---|
-| `wall_approach` | All cells ramp from silent to max as a wall closes in |
-| `doorway_left` | Left columns stay quiet (open corridor), right columns activate |
-| `person_crossing` | High-intensity blob marches right-to-left across columns |
-| `all_clear` | All cells silent |
+| Component | Part |
+|-----------|------|
+| Main board | Arduino UNO Q (QRB2210, arm64, Debian 13) |
+| Depth camera | Orbbec Astra Pro / Astra Pro Plus |
+| Motor driver | Internal STM32 on the UNO Q |
+| Hub | Powered USB hub (camera browns out without it) |
 
-Step through frames manually (useful for debugging):
-```bat
-run.bat --scene wall_approach --step
-```
+Board access: `arduino@10.221.208.1`, password `vidhu123`  
+Web UI: `http://10.221.208.1:8081`
 
 ---
 
-## Adding a new scene
+## Project files
 
-1. Open `src/tactile/depth_source.py`
-2. Write a generator that yields `(8, 2)` float32 arrays indefinitely (loop at the end). Use `np.nan` for invalid cells. Axis 0 = column (0 = wearer's left), axis 1 = row (0 = top).
-3. Register it in `_SCENES`:
-   ```python
-   _SCENES["my_scene"] = _my_scene
-   ```
-4. Run it: `run.bat --scene my_scene`
+### Linux (runs on the UNO Q)
 
----
+| File | Purpose |
+|------|---------|
+| `linux/haptic_depth_server.py` | Main server — reads depth frames, computes 21-cell haptic grid, serves HTTP/MJPEG/WebSocket and triggers capture |
+| `linux/rgb_worker.py` | Subprocess — captures RGB frame on demand via OpenCV |
+| `linux/uart_sender.py` | Subprocess — sends 24-byte haptic grid packets to STM32 via UART |
+| `linux/haptic-demo.service` | systemd unit — auto-starts the server, sets MALLOC tunables, restarts on crash |
+| `linux/setup.sh` | One-time setup script — installs Python deps, udev rules, services |
 
-## Camera setup — Windows (Orbbec Astra Pro Plus)
+### Arduino (runs on the internal STM32)
 
-No separate SDK download needed — `setup.bat` already installs everything.
-
-Plug in the camera, then run:
-
-```bat
-check_camera.bat
-```
-
-Expected output when working:
-```
-✓ USB device detected
-✓ pyorbbecsdk2 installed
-✓ Device found by SDK
-✓ Device info read
-✓ Depth stream readable
-```
-
-If the device shows a yellow warning in Device Manager, right-click it → "Update driver" → "Search automatically".
+| File | Purpose |
+|------|---------|
+| `linux/tactile_receiver.ino` | Receives 24-byte haptic grid frames over UART, drives motor PWM pins |
 
 ---
 
-## Camera setup — Linux (reference)
+## Quick start after SSH
 
 ```bash
-sudo apt install usbutils
-pip3 install numpy pyyaml pyorbbecsdk2
-sudo usermod -aG plugdev $USER   # log out and back in after this
-python3 check_camera.py
+# Check service status
+systemctl status haptic-demo
+
+# Watch live logs
+journalctl -fu haptic-demo
+
+# Open web UI in browser
+# http://10.221.208.1:8081
 ```
 
----
-
-## Running tests
-
-```bat
-test.bat
-```
+The web UI provides:
+- Live depth MJPEG stream
+- Haptic grid visualization (21 cells, 3×7)
+- USB host/device toggle (needed to connect the camera)
+- Capture button (grabs RGB + depth PNG, broadcasts via WebSocket)
 
 ---
 
-## What changes when the real camera is wired in
+## HTTP API
 
-Replace `MockSource` with an `OrbecSource(DepthSource)` class that:
-- Uses `pyorbbecsdk`: `Context` → `query_devices()` → `Pipeline` → `wait_for_frames()`
-- Reads one depth frame per `get_grid()` call
-- Averages depth pixels within each of the 8×2 spatial patches
-- Returns `np.nan` where `depth_mm == 0` (camera reports invalid/out-of-range)
-
-No other file changes needed — `Encoder`, `SimDisplay`, and `main.py` are hardware-agnostic.
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/` | GET | Web UI |
+| `/grid` | GET | JSON `{grid, raw_mm, status, usb_mode}` |
+| `/depth.mjpg` | GET | Live colorized depth MJPEG stream |
+| `/toggle` | POST | Flip USB host ↔ device mode |
+| `/capture` | POST | Trigger one-shot RGB+depth capture |
+| `:8083` | WebSocket | Receives capture bundle `{ts, rgb_b64, depth_b64}` |
 
 ---
 
-## Documentation index
+## Documentation
 
 | File | Contents |
 |------|----------|
-| [app.md](app.md) | Full bringup guide for the UNO Q board — WiFi, USB host mode, SSH, HTTP endpoints, MJPEG stream, WebSocket capture, haptic grid polling, shared-memory IPC |
-| [stm.md](stm.md) | Linux ↔ STM32 communication guide — ttyHS1 UART bridge, packet format (24-byte haptic grid), Arduino sketch template, motor wiring |
-| [hard-fact.md](hard-fact.md) | Camera hard facts — Orbbec Astra Pro Plus specs, OpenNI2 SDK paths, frame format, known driver quirks on the UNO Q |
-| [debug.md](debug.md) | Bug catalogue — root causes and fixes for every issue found across development sessions (SIGSEGV crashes, memory leaks, capture race conditions, logging) |
+| [app.md](app.md) | Full bringup guide — WiFi, USB host mode, SSH, endpoints, haptic grid IPC |
+| [stm.md](stm.md) | Linux ↔ STM32 UART protocol, packet format, Arduino sketch guide |
+| [hard-fact.md](hard-fact.md) | Camera specs, OpenNI2 SDK paths, known driver quirks on the UNO Q |
+| [debug.md](debug.md) | Bug catalogue — root causes and fixes for all issues found during development |
+
+---
+
+## Deploy / update server
+
+```bash
+# From Mac:
+scp linux/haptic_depth_server.py arduino@10.221.208.1:~/
+scp linux/haptic-demo.service arduino@10.221.208.1:/tmp/
+
+ssh arduino@10.221.208.1
+echo 'vidhu123' | sudo -S cp /tmp/haptic-demo.service /etc/systemd/system/
+echo 'vidhu123' | sudo -S systemctl daemon-reload
+echo 'vidhu123' | sudo -S systemctl restart haptic-demo
+
+# Verify MALLOC tunables loaded
+cat /proc/$(pgrep -f haptic_depth_server.py | head -1)/environ | tr '\0' '\n' | grep MALLOC
+```
+
+---
+
+## After a reboot
+
+```bash
+# 1. USB host mode should be automatic (usb-host-mode.service)
+cat /sys/devices/platform/soc@0/4ef8800.usb/4e00000.usb/usb_role/4e00000.usb-role-switch/role
+# expected: host
+
+# 2. Camera detected on USB
+lsusb | grep 2bc5   # expect two lines (depth 060f + RGB 050f)
+
+# 3. Server running
+systemctl status haptic-demo
+```
