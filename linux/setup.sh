@@ -94,7 +94,7 @@ echo "  done"
 echo "[5/7] usb-host-mode.service..."
 sudo tee /etc/systemd/system/usb-host-mode.service > /dev/null <<EOF
 [Unit]
-Description=Boot USB-C into device mode (user toggles to host via web UI)
+Description=Force USB-C into host mode so the Orbbec depth camera enumerates
 After=sysinit.target
 DefaultDependencies=no
 Conflicts=adbd.service
@@ -102,7 +102,11 @@ Conflicts=adbd.service
 [Service]
 Type=oneshot
 RemainAfterExit=yes
-ExecStart=/bin/sh -c 'sleep 2 && echo device > $ROLE_SYSFS'
+# The Qualcomm ADSP/OTG state machine tears down xHCI and re-enables the USB
+# gadget at ~16s into boot. Wait 25s so this write lands after that and sticks;
+# a 2-second delay is overwritten by the ADSP switch and has no effect.
+# Disable this unit to boot into device mode instead.
+ExecStart=/bin/sh -c 'sleep 25 && /usr/local/bin/usb-role host'
 
 [Install]
 WantedBy=multi-user.target

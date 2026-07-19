@@ -38,6 +38,7 @@ def main():
     lib.oniStreamReadFrame.restype    = ctypes.c_int
     lib.oniWaitForAnyStream.restype   = ctypes.c_int
     lib.oniFrameRelease.restype       = None
+    lib.oniFrameRelease.argtypes      = [ctypes.c_void_p]  # OniFrame*, NOT OniFrame**
 
     log("initializing OpenNI2...")
     if lib.oniInitialize(2) != 0:
@@ -60,7 +61,7 @@ def main():
                 frame = ctypes.c_void_p()
                 lib.oniStreamReadFrame(stream, ctypes.byref(frame))
                 if frame.value:
-                    lib.oniFrameRelease(ctypes.byref(frame))
+                    lib.oniFrameRelease(frame)
 
             log("streaming")
             streams_arr  = (ctypes.c_void_p * 1)(stream.value)
@@ -94,14 +95,14 @@ def main():
                 if (data_addr and 0 < data_size <= MAX_FRAME
                         and 0 < w <= 640 and 0 < h <= 480):
                     raw = ctypes.string_at(data_addr, data_size)
-                    lib.oniFrameRelease(ctypes.byref(frame))
+                    lib.oniFrameRelease(frame)
                     # Write frame to stdout: 8-byte header + frame bytes
                     out.write(struct.pack('<HHI', w, h, len(raw)))
                     out.write(raw)
                     out.flush()
                     del raw
                 else:
-                    lib.oniFrameRelease(ctypes.byref(frame))
+                    lib.oniFrameRelease(frame)
 
         except Exception as e:
             log(f"camera: {e}")

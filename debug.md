@@ -132,6 +132,65 @@ camera_reader.py (child process — contains all OpenNI2 ctypes code)
 
 ---
 
+## BUG-009: The real cause of BUG-005 — malformed `oniFrameRelease` call (SUPERSEDES BUG-005)
+
+**BUG-005's stated root cause is wrong.** There is no "internal bug in libOpenNI2.so that
+triggers a SIGSEGV after ~2300 depth frames". The crash was heap corruption caused by our own
+ctypes binding, and it is now fixed.
+
+**Root cause:** The OpenNI2 C API is `void oniFrameRelease(OniFrame* pFrame)` — it takes the
+frame pointer. The code passed `ctypes.byref(frame)`, i.e. the *address of the local ctypes
+variable* (`OniFrame**`). OpenNI2 then decremented a refcount through a bogus pointer,
+corrupting the heap. The crash point drifted with allocator state, which is exactly why it
+looked like a frame-count threshold.
+
+Note `oniStreamReadFrame(stream, ctypes.byref(frame))` is correct — that call genuinely takes
+`OniFrame**`. Only the release call was wrong.
+
+**Evidence:**
+- glibc `double free or corruption (fasttop)`, then a reliable SIGSEGV after exactly 3 frames
+  (1,843,224 bytes captured = 3 x 614,408).
+- BUG-005's own note that `MALLOC_TRIM_THRESHOLD_` "may expose OpenNI2 UAF" was the right
+  instinct — aggressive trimming made the corruption fault sooner.
+
+**Fix:** pass the handle directly, and declare `argtypes` so ctypes cannot silently
+mis-marshal it again:
+```python
+lib.oniFrameRelease.argtypes = [ctypes.c_void_p]   # OniFrame*, NOT OniFrame**
+lib.oniFrameRelease(frame)                          # was: ctypes.byref(frame)
+```
+Applied at 3 call sites in `linux/camera_reader.py` and 3 in `linux/haptic_depth_server.py`
+(the latter inside the now-dead inline `camera_loop`, kept consistent so re-enabling it is safe).
+
+**Result:** 5,235 frames in 180 s at ~29 fps, no crash — straight past the 2,300 "ceiling".
+Service soaked with **0** `reader exited` events.
+
+**Consequence:** the subprocess isolation from BUG-005 is now belt-and-braces rather than
+load-bearing. Keep it (it is still good defence), but the ~6-8 s stream gap every ~76 s that
+BUG-005 lists as an expected user-visible effect **should no longer happen at all**. If it
+reappears, something else is wrong.
+
+---
+
+## BUG-010: `setup.sh` provisions the USB unit in *device* mode
+
+**Symptom:** After a fresh `setup.sh` run or reflash, `lsusb` is empty and `/grid` reports
+`"waiting for camera"` forever. Boot dmesg shows xHCI enumerating the camera at t=5s, then
+`xhci-hcd: remove` and `usb_vbus: disabling` at t=15s.
+
+**Root cause:** `linux/setup.sh` step 5 wrote a unit named `usb-host-mode.service` whose
+`ExecStart` was `sleep 2 && echo device > $ROLE_SYSFS`. Two faults: it wrote **device**, and a
+2-second delay lands *before* the Qualcomm ADSP/OTG switch at ~16s, so the write is discarded
+anyway. This contradicts `hard-fact.md`, which documents the unit as a 25-second delayed
+oneshot that forces **host**.
+
+**Fix:** `setup.sh` now emits `sleep 25 && /usr/local/bin/usb-role host`.
+
+**To boot into device mode instead** (App Lab / ADB / WiFi setup), disable the unit rather than
+editing it — `hard-fact.md` documents the web-UI toggle as doing exactly this.
+
+---
+
 ## Key configuration facts for debugging
 
 | Setting | Value | Why |
