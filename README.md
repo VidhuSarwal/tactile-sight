@@ -105,3 +105,14 @@ Replace `MockSource` with an `OrbecSource(DepthSource)` class that:
 - Returns `np.nan` where `depth_mm == 0` (camera reports invalid/out-of-range)
 
 No other file changes needed — `Encoder`, `SimDisplay`, and `main.py` are hardware-agnostic.
+
+---
+
+## Documentation index
+
+| File | Contents |
+|------|----------|
+| [app.md](app.md) | Full bringup guide for the UNO Q board — WiFi, USB host mode, SSH, HTTP endpoints, MJPEG stream, WebSocket capture, haptic grid polling, shared-memory IPC |
+| [stm.md](stm.md) | Linux ↔ STM32 communication guide — ttyHS1 UART bridge, packet format (24-byte haptic grid), Arduino sketch template, motor wiring |
+| [hard-fact.md](hard-fact.md) | Camera hard facts — Orbbec Astra Pro Plus specs, OpenNI2 SDK paths, frame format, known driver quirks on the UNO Q |
+| [debug.md](debug.md) | Bug catalogue — root causes and fixes for every issue found across development sessions (SIGSEGV crashes, memory leaks, capture race conditions, logging) |
