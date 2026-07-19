@@ -352,6 +352,66 @@ async def _ws_main():
         await asyncio.Future()   # run forever
 
 
+def camera_subprocess_watchdog():
+    """Run camera_reader.py in a subprocess.
+
+    OpenNI2 SIGSEGVs after ~2300 frames on this hardware. Running it in a
+    subprocess means the SIGSEGV kills only camera_reader.py; the HTTP server,
+    WebSocket, and haptic grid stay alive. The watchdog restarts the reader
+    automatically, so the depth stream resumes within ~6-8 seconds.
+    """
+    reader_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                               "camera_reader.py")
+    if not os.path.exists(reader_path):
+        log("camera: camera_reader.py not found — falling back to in-process camera_loop")
+        camera_loop()
+        return
+
+    while True:
+        proc = None
+        try:
+            proc = subprocess.Popen(
+                ["python3", reader_path],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            log(f"camera: reader started (pid {proc.pid})")
+            _status[0] = "starting camera..."
+
+            import threading as _thr
+
+            def _log_stderr():
+                for line in proc.stderr:
+                    log("cam: " + line.decode(errors='replace').rstrip())
+
+            _thr.Thread(target=_log_stderr, daemon=True).start()
+
+            out = proc.stdout
+            while True:
+                hdr_bytes = out.read(8)
+                if len(hdr_bytes) < 8:
+                    break  # subprocess died
+                w, h, size = struct.unpack('<HHI', hdr_bytes)
+                raw = out.read(size)
+                if len(raw) < size:
+                    break
+                _status[0] = "streaming"
+                try:
+                    _raw_frame_q.put_nowait((raw, w, h))
+                except queue.Full:
+                    pass
+                del raw
+
+            rc = proc.wait()
+            _status[0] = "waiting for camera (reader crashed)"
+            log(f"camera: reader exited (rc={rc}) — restarting in 3s")
+
+        except Exception as e:
+            log(f"camera: watchdog error: {e}")
+            if proc:
+                try: proc.kill()
+                except Exception: pass
+        time.sleep(3)
+
+
 def uart_sender_watchdog():
     """Launch uart_sender.py as a subprocess; restart it if it crashes."""
     sender_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
@@ -871,8 +931,8 @@ if __name__ == "__main__":
     else:
         log(f"WARNING: rgb_worker.py not found — RGB capture disabled")
 
-    threading.Thread(target=camera_loop,         daemon=True).start()
-    threading.Thread(target=frame_processor,     daemon=True).start()
+    threading.Thread(target=camera_subprocess_watchdog, daemon=True).start()
+    threading.Thread(target=frame_processor,            daemon=True).start()
     threading.Thread(target=ws_server_loop,      daemon=True).start()
     threading.Thread(target=capture_worker,      daemon=True).start()
     threading.Thread(target=uart_sender_watchdog, daemon=True).start()

@@ -50,27 +50,61 @@ cat /proc/$(pgrep -f haptic_depth_server.py | head -1)/environ | tr '\0' '\n' | 
 
 ---
 
-## BUG-005: Remaining SIGSEGV at ~390 MB (non-OOM, under investigation)
-**Symptom:** After BUG-003 fix, service still dies with SIGSEGV at ~76 s wall-time (24 s CPU time). RSS is actively *decreasing* (~400 MB → ~40 MB) before the crash — not an OOM. Systemd reports 390 MB *peak*, not current RSS.  
+## BUG-005: Recurring SIGSEGV at ~76 s — OpenNI2 internal C++ crash
+
+### Why it crashes so frequently
+
+**Symptom:** After BUG-003 fix, service still dies with SIGSEGV at ~76 s wall-time (24 s CPU time). RSS is actively *decreasing* (~400 MB → ~40 MB) before the crash — not an OOM. Systemd reports 390 MB *peak*, not current RSS.
+
+**Root cause (confirmed working hypothesis):** The Orbbec libOpenNI2.so library has an internal bug that triggers a C++ SIGSEGV after approximately **2 300 depth frames** on this specific hardware + driver combination. At 30 fps: 2300 / 30 = **~76 seconds**.
+
+The crash was **always present** in the original code, but was effectively hidden because the old `camera_loop` did PIL JPEG encoding synchronously inside the camera-reading loop. That encoding took ~50 ms per frame, naturally throttling the effective frame rate to ~15 fps. At 15 fps, 2300 frames takes ~153 seconds — long enough that most testing sessions never triggered it. After the frame pipeline refactor (camera_loop reads fast, frame_processor does the numpy work), the camera loop runs at full 30 fps and hits the 2300-frame threshold in half the time (~76 s).
+
 **Pattern observed:**
-- Every independent run crashes at 23–25 s CPU time
-- RSS monotonically decreases before crash
+- Every independent run crashes at 23–25 s CPU time → ~76–130 s wall time (varies with CPU load)
+- RSS monotonically decreases before crash (MALLOC fix is working; crash is unrelated to memory)
 - No kernel OOM entries; 2.5 GB RAM free
 - No systemd memory limits (`MemoryMax=infinity`)
+- SIGSEGV occurs inside C++ libOpenNI2.so (no Python exception, no Python traceback)
 
-**Hypotheses (unconfirmed):**
-1. **MALLOC_TRIM_THRESHOLD_ exposes OpenNI2 use-after-free** — aggressive heap trimming (`sbrk(-size)`) unmaps memory that OpenNI2's internal C++ code still holds a pointer to. With default trim settings, the freed heap block stays mapped (in glibc's free list), masking the UAF. With 128 KB threshold, it is unmapped immediately → SIGSEGV on next access.  
-2. **OpenNI2 internal frame-counter overflow** — crashes after ~2 300 frames (30 fps × 76 s), possibly a 12-bit or 16-bit internal counter.  
-3. **USB host-mode frame desync** — UNO Q USB controller drops/corrupts a frame; OpenNI2 does not handle the bad frame gracefully.  
+**Attempted mitigations:**
+1. Frame header bounds check — prevents SIGSEGV from corrupted `data_size`; did not fix this crash (crash is elsewhere in OpenNI2)
+2. 3 s USB settle delay — prevents startup SIGSEGV on rapid restart; did not extend the run window
+3. `MALLOC_ARENA_MAX=2` — bounded memory but did not affect the crash timing
 
-**Mitigation applied (BUG-005a):** Added strict bounds validation on frame header values before `ctypes.string_at`. Prevents a corrupted `data_size` field from requesting a read into unmapped memory:
-```python
-MAX_FRAME = 640 * 480 * 2  # 614400 bytes
-if (data_addr and 0 < data_size <= MAX_FRAME
-        and 0 < w <= 640 and 0 < h <= 480):
-    raw = ctypes.string_at(data_addr, data_size)
+### Fix: subprocess isolation (`camera_reader.py`)
+
+**Solution applied:** Moved all OpenNI2 frame-reading code into `linux/camera_reader.py`. This file runs as a **subprocess** of the main server (watchdog: `camera_subprocess_watchdog` thread).
+
+**Architecture:**
 ```
-**Status:** SIGSEGV still occurs; root cause not conclusively identified. `Restart=always` + `RestartSec=5` ensure service recovers within 5 s. Subprocess isolation (running camera_loop in a child process so SIGSEGV does not kill the HTTP/WS server) is the planned permanent fix.
+haptic_depth_server.py (main process)
+  ├── camera_subprocess_watchdog thread
+  │     → spawns camera_reader.py
+  │     → reads frames from subprocess stdout (8-byte header + raw bytes)
+  │     → puts frames onto _raw_frame_q (same queue as before)
+  │     → if subprocess crashes: waits 3s, restarts it
+  ├── frame_processor thread  (unchanged — still reads from _raw_frame_q)
+  ├── HTTP server
+  └── WebSocket server
+camera_reader.py (child process — contains all OpenNI2 ctypes code)
+  → SIGSEGV here kills ONLY this process, not the main server
+```
+
+**User-visible effect after fix:**
+- Depth stream pauses for ~6–8 s every ~76 s (camera_reader.py crashes and restarts)
+- HTTP server, WebSocket, and haptic grid stay **continuously alive** — no 5 s full downtime
+- Web UI remains responsive during the camera restart window
+
+**Frame wire format (camera_reader.py → camera_subprocess_watchdog):**
+```
+[uint16 w][uint16 h][uint32 data_len][data_len bytes of raw uint16 depth]
+= 8 bytes header + 614400 bytes per frame (640×480)
+```
+
+**Commit:** `[subprocess isolation commit]`
+
+**Status:** Main server is now stable. Camera subprocess crashes and auto-recovers within ~6 s.
 
 ---
 

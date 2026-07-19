@@ -20,21 +20,34 @@ Web UI: `http://10.221.208.1:8081`
 
 ## Project files
 
-### Linux (runs on the UNO Q)
+### Linux (runs on the UNO Q) — active
 
 | File | Purpose |
 |------|---------|
-| `linux/haptic_depth_server.py` | Main server — reads depth frames, computes 21-cell haptic grid, serves HTTP/MJPEG/WebSocket and triggers capture |
+| `linux/haptic_depth_server.py` | Main server — HTTP/MJPEG/WebSocket + haptic grid; spawns camera and UART subprocesses |
+| `linux/camera_reader.py` | Subprocess — reads OpenNI2 depth frames; isolated so SIGSEGV doesn't kill the server |
 | `linux/rgb_worker.py` | Subprocess — captures RGB frame on demand via OpenCV |
 | `linux/uart_sender.py` | Subprocess — sends 24-byte haptic grid packets to STM32 via UART |
 | `linux/haptic-demo.service` | systemd unit — auto-starts the server, sets MALLOC tunables, restarts on crash |
 | `linux/setup.sh` | One-time setup script — installs Python deps, udev rules, services |
 
-### Arduino (runs on the internal STM32)
+### Arduino (runs on the internal STM32) — active
 
 | File | Purpose |
 |------|---------|
 | `linux/tactile_receiver.ino` | Receives 24-byte haptic grid frames over UART, drives motor PWM pins |
+
+### Stale / not used in current build
+
+| File | Notes |
+|------|-------|
+| `linux/matrix_display.ino` | LED matrix sketch — superseded by `tactile_receiver.ino` |
+| `linux/yolo_worker.py` | YOLO object detection worker — not integrated in main server |
+| `linux/models/yolov8n.pt` | YOLO model file — for `yolo_worker.py` (unused) |
+| `linux/visualizer.html` | Standalone depth visualizer HTML — standalone only, not served by server |
+| `main.py` | Windows simulation entry point — irrelevant on the UNO Q |
+| `check_camera.py` | Windows camera checker — use `hard-fact.md` checklist on Linux instead |
+| `src/`, `tests/` | Windows simulation source and tests — not used in the Linux build |
 
 ---
 
