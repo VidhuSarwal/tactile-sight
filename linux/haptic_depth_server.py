@@ -183,6 +183,9 @@ def camera_loop():
     lib.oniWaitForAnyStream.restype   = ctypes.c_int
     lib.oniFrameRelease.restype       = None
 
+    # Allow camera USB to settle after a process restart (prevents SIGSEGV during
+    # oniInitialize when the USB device is still resetting from a prior crash)
+    time.sleep(3)
     _status[0] = "initializing OpenNI2..."
     log(_status[0])
     if lib.oniInitialize(2) != 0:
@@ -242,7 +245,9 @@ def camera_loop():
                 w         = struct.unpack_from('<i', hdr, 36)[0]
                 h         = struct.unpack_from('<i', hdr, 40)[0]
 
-                if data_addr and data_size > 0 and w > 0 and h > 0:
+                MAX_FRAME = 640 * 480 * 2  # 614400 bytes
+                if (data_addr and 0 < data_size <= MAX_FRAME
+                        and 0 < w <= 640 and 0 < h <= 480):
                     raw = ctypes.string_at(data_addr, data_size)
                     lib.oniFrameRelease(ctypes.byref(frame))
                     # Enqueue for processing; drop frame if processor is behind
